@@ -44,7 +44,9 @@ def _make_mock_item(title="", author="", cover=""):
 
 
 def test_parse_items_basic():
-    items = [_make_mock_item("Dune", "Frank Herbert", "http://cover.example.com/dune.jpg")]
+    items = [
+        _make_mock_item("Dune", "Frank Herbert", "http://cover.example.com/dune.jpg")
+    ]
     result = _parse_items(items)
     assert len(result) == 1
     assert result[0][0] == "Dune"
@@ -127,7 +129,9 @@ def test_write_csv_headers():
 
 
 def test_write_csv_isbn13_mapping():
-    records = [("Dune", "Frank Herbert", "9781402894626", "http://cover.example.com/dune.jpg")]
+    records = [
+        ("Dune", "Frank Herbert", "9781402894626", "http://cover.example.com/dune.jpg")
+    ]
     with tempfile.TemporaryDirectory() as tmp:
         path = write_csv(records, tmp)
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -167,10 +171,28 @@ def test_write_csv_empty_non_mapped_columns():
         with open(path, newline="", encoding="utf-8-sig") as f:
             rows = list(csv.DictReader(f))
     non_mapped = [
-        "added", "began_date", "call_numbers", "completed_date", "copies",
-        "description", "group", "ddc", "lcc", "lccn", "oclc", "lexile",
-        "length_of", "number_of_discs", "aspect_ratio", "price",
-        "publish_date", "publisher", "rating", "review", "review_date", "status",
+        "added",
+        "began_date",
+        "call_numbers",
+        "completed_date",
+        "copies",
+        "description",
+        "group",
+        "ddc",
+        "lcc",
+        "lccn",
+        "oclc",
+        "lexile",
+        "length_of",
+        "number_of_discs",
+        "aspect_ratio",
+        "price",
+        "publish_date",
+        "publisher",
+        "rating",
+        "review",
+        "review_date",
+        "status",
     ]
     for col in non_mapped:
         assert rows[0][col] == "", f"Expected empty string for column '{col}'"
