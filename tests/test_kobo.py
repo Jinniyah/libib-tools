@@ -9,7 +9,7 @@ from kobo_to_libib.core import (
     write_csv,
     write_unresolved,
 )
-from lib import LIBIB_HEADERS, classify_identifier, dedupe_books_by_title, filter_invalid_books
+from lib import LIBIB_HEADERS, dedupe_books_by_title, filter_invalid_books
 
 # ==========================
 # PARSE ITEMS
