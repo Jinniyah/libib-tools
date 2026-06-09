@@ -114,29 +114,41 @@ def _build_driver() -> webdriver.Chrome:
 
 
 def _login(driver: webdriver.Chrome) -> None:
-    """Open the Kobo sign-in page and pause for the user to log in manually.
+    """Log in to Kobo using a manual two-tab strategy to bypass hCaptcha.
 
-    After the user presses Enter we verify the library is visible by checking
-    for ``li.item-wrapper.book`` — the actual book-card element from the DOM.
+    hCaptcha on authorize.kobo.com fingerprints the first Selenium-opened tab
+    and blocks it.  Opening a second tab manually — by copying the URL from
+    tab 1 into a new tab — inherits the session context and passes cleanly.
+
+    Flow:
+      1. Tab 1  — Selenium opens the sign-in page (fingerprinted/blocked).
+      2. Tab 2  — user opens manually by copying the URL; login succeeds here.
+      3. User navigates to My Books → Books and presses Enter.
+      4. Script switches focus to the last tab and verifies the book grid.
     """
-    log.info("Navigating to Kobo sign-in page…")
+    log.info("Opening Kobo sign-in page…")
     driver.get(KOBO_LOGIN_URL)
 
     print(
-        "\n[ACTION REQUIRED] The Kobo sign-in page is now open in your browser.\n"
-        "  1. Log in with your credentials (and solve any CAPTCHA if shown).\n"
-        "     a. Copy the link, then open a second tab, paste the link, and then relogin.\n"
-        "  2. Navigate to your library (My Books → Books) and wait for\n"
+        "\n[ACTION REQUIRED] The Kobo sign-in page is open in your browser.\n"
+        "  Kobo's CAPTCHA blocks login on this tab — follow these steps:\n"
+        "\n"
+        "  1. Copy the URL from the address bar.\n"
+        "  2. Open a NEW TAB manually (Ctrl+T) and paste the URL.\n"
+        "  3. Log in with your credentials in that new tab.\n"
+        "  4. Navigate to your library (My Books → Books) and wait for\n"
         "     the book grid to fully load.\n"
-        "  3. Then come back here and press Enter to continue: ",
+        "  5. Come back here and press Enter to continue: ",
         end="",
         flush=True,
     )
     input()
 
-    # Confirm we can see at least one book card before proceeding.
+    # Switch to whichever tab the user last navigated to.
+    driver.switch_to.window(driver.window_handles[-1])
+
+    # Confirm we can see at least one book card.
     try:
-        driver.switch_to.window(driver.window_handles[-1])
         WebDriverWait(driver, PAGE_WAIT_TIMEOUT).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, _SEL_BOOK_ITEM))
         )
