@@ -1,12 +1,12 @@
 [project]
 name = "libibtools"
 version = "0.1.0"
-description = "Scrape Chirp and Kindle libraries and export Libib-compatible CSVs"
+description = "Scrape Chirp, Kindle, and Kobo libraries and export Libib-compatible CSVs"
 authors = [{ name = "Jennifer M" }]
 requires-python = ">=3.10"
 
 [tool.setuptools]
-packages = ["chirp_to_libib", "kindle_to_libib", "lib"]
+packages = ["chirp_to_libib", "kindle_to_libib", "kobo_to_libib", "lib"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
