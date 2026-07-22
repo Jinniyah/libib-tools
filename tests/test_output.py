@@ -2,7 +2,7 @@ import csv
 import os
 import tempfile
 
-from lib import LIBIB_HEADERS, classify_identifier
+from lib import EnrichmentResult, LIBIB_HEADERS, classify_identifier
 
 from chirp_to_libib.core import (
     write_csv as chirp_write_csv,
@@ -12,6 +12,9 @@ from kindle_to_libib.core import (
     write_csv as kindle_write_csv,
     write_unresolved as kindle_write_unresolved,
 )
+
+# Stand-in for a book with no enrichment data — matches --no-enrich output.
+EMPTY = EnrichmentResult()
 
 # ==========================
 # IDENTIFIER CLASSIFICATION
@@ -94,7 +97,7 @@ def test_libib_headers_match_spec():
 
 
 def test_chirp_write_csv_headers():
-    records = [("Title A", "Author A", "1234567890", "coverA")]
+    records = [("Title A", "Author A", "1234567890", "coverA", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         path = chirp_write_csv(records, tmp)
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -104,8 +107,8 @@ def test_chirp_write_csv_headers():
 
 def test_chirp_write_csv_mapping():
     records = [
-        ("Title A", "Author A", "1234567890", "http://cover.example.com/a.jpg"),
-        ("Title B", "Author B", None, ""),
+        ("Title A", "Author A", "1234567890", "http://cover.example.com/a.jpg", EMPTY),
+        ("Title B", "Author B", None, "", EMPTY),
     ]
     with tempfile.TemporaryDirectory() as tmp:
         path = chirp_write_csv(records, tmp)
@@ -130,7 +133,7 @@ def test_chirp_write_csv_mapping():
 
 
 def test_chirp_write_csv_isbn13():
-    records = [("Title C", "Author C", "9781234567897", "cover")]
+    records = [("Title C", "Author C", "9781234567897", "cover", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         path = chirp_write_csv(records, tmp)
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -141,7 +144,7 @@ def test_chirp_write_csv_isbn13():
 
 def test_chirp_write_csv_empty_columns():
     """All non-mapped columns must be empty strings."""
-    records = [("Title A", "Author A", "1234567890", "cover")]
+    records = [("Title A", "Author A", "1234567890", "cover", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         path = chirp_write_csv(records, tmp)
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -180,7 +183,7 @@ def test_chirp_write_csv_empty_columns():
 
 
 def test_kindle_write_csv_headers():
-    records = [("Title A", "Author A", "9781402894626", "coverA")]
+    records = [("Title A", "Author A", "9781402894626", "coverA", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         path = kindle_write_csv(records, tmp)
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -190,8 +193,14 @@ def test_kindle_write_csv_headers():
 
 def test_kindle_write_csv_mapping():
     records = [
-        ("Title A", "Author A", "9781402894626", "http://cover.example.com/a.jpg"),
-        ("Title B", "Author B", None, ""),
+        (
+            "Title A",
+            "Author A",
+            "9781402894626",
+            "http://cover.example.com/a.jpg",
+            EMPTY,
+        ),
+        ("Title B", "Author B", None, "", EMPTY),
     ]
     with tempfile.TemporaryDirectory() as tmp:
         path = kindle_write_csv(records, tmp)
@@ -215,7 +224,7 @@ def test_kindle_write_csv_mapping():
 
 
 def test_kindle_write_csv_isbn10():
-    records = [("Title D", "Author D", "1402894627", "cover")]
+    records = [("Title D", "Author D", "1402894627", "cover", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         path = kindle_write_csv(records, tmp)
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -226,7 +235,7 @@ def test_kindle_write_csv_isbn10():
 
 def test_kindle_write_csv_empty_columns():
     """All non-mapped columns must be empty strings."""
-    records = [("Title A", "Author A", "9781402894626", "cover")]
+    records = [("Title A", "Author A", "9781402894626", "cover", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         path = kindle_write_csv(records, tmp)
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -260,14 +269,78 @@ def test_kindle_write_csv_empty_columns():
 
 
 # ==========================
+# ENRICHMENT FIELD MAPPING
+# ==========================
+
+
+def test_chirp_write_csv_enrichment_mapping():
+    enrichment = EnrichmentResult(
+        description="A great book.",
+        publisher="Tor Books",
+        publish_date="2020",
+        length_of="320",
+        series_name="The Dragon Knight",
+        series_position=9,
+    )
+    records = [("Title A", "Author A", "1234567890", "cover-url", enrichment)]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = chirp_write_csv(records, tmp)
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+
+    assert rows[0]["description"] == "A great book."
+    assert rows[0]["publisher"] == "Tor Books"
+    assert rows[0]["publish_date"] == "2020"
+    assert rows[0]["length_of"] == "320"
+    assert rows[0]["group"] == "The Dragon Knight"
+    assert rows[0]["notes"] == (
+        "Series: The Dragon Knight #009 || Additional Notes: cover-url"
+    )
+
+
+def test_chirp_write_csv_enrichment_fills_missing_isbn():
+    enrichment = EnrichmentResult(isbn13="9781234567897")
+    records = [("Title A", "Author A", None, "cover", enrichment)]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = chirp_write_csv(records, tmp)
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+
+    assert rows[0]["ean_isbn13"] == "9781234567897"
+    assert rows[0]["upc_isbn10"] == ""
+
+
+def test_kindle_write_csv_enrichment_mapping():
+    enrichment = EnrichmentResult(
+        description="Another great book.",
+        publisher="Ace",
+        publish_date="1999",
+        length_of="200",
+        series_name="Some Series",
+        series_position=None,
+    )
+    records = [("Title A", "Author A", "9781402894626", "cover-url", enrichment)]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = kindle_write_csv(records, tmp)
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+
+    assert rows[0]["description"] == "Another great book."
+    assert rows[0]["group"] == "Some Series"
+    assert rows[0]["notes"] == (
+        "Series: Some Series #ZZZ || Additional Notes: cover-url"
+    )
+
+
+# ==========================
 # UNRESOLVED OUTPUT TESTS
 # ==========================
 
 
 def test_chirp_write_unresolved():
     records = [
-        ("Title A", "Author A", "1234567890", "coverA"),
-        ("Title B", "Author B", None, "coverB"),
+        ("Title A", "Author A", "1234567890", "coverA", EMPTY),
+        ("Title B", "Author B", None, "coverB", EMPTY),
     ]
     with tempfile.TemporaryDirectory() as tmp:
         path = chirp_write_unresolved(records, tmp)
@@ -280,8 +353,8 @@ def test_chirp_write_unresolved():
 
 def test_kindle_write_unresolved():
     records = [
-        ("Title A", "Author A", "9781402894626", "coverA"),
-        ("Title B", "Author B", None, "coverB"),
+        ("Title A", "Author A", "9781402894626", "coverA", EMPTY),
+        ("Title B", "Author B", None, "coverB", EMPTY),
     ]
     with tempfile.TemporaryDirectory() as tmp:
         path = kindle_write_unresolved(records, tmp)

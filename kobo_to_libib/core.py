@@ -5,15 +5,19 @@ import csv
 import logging
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 from lib import (
     LIBIB_HEADERS,
+    EnrichmentResult,
     classify_identifier,
     dedupe_books_by_title,
+    enrich_book,
     filter_invalid_books,
+    format_series_notes,
     get_isbn,
     sleep_between_requests,
 )
@@ -31,8 +35,21 @@ from webdriver_manager.chrome import ChromeDriverManager
 # ==========================
 
 ISBN_LOG_INTERVAL: int = 25
+ENRICH_LOG_INTERVAL: int = 25
 PAGE_WAIT_TIMEOUT: int = 30  # seconds
 LIBIB_TYPE = "kobo,ebook"
+
+# Used in place of a real EnrichmentResult when --no-enrich is set.
+_NULL_ENRICHMENT = EnrichmentResult()
+
+
+@dataclass
+class RunResult:
+    csv_path: Optional[str]
+    unresolved_path: Optional[str]
+    total_books: int
+    resolved_count: int
+
 
 # Kobo library URL — the locale segment (us/en) varies by account region.
 # We navigate to the root login page first, then follow the redirect to the
@@ -77,6 +94,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pages", type=int, default=None, metavar="N")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-dir", default=".", metavar="PATH")
+    parser.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="Skip metadata/series enrichment (faster, no extra HTTP calls).",
+    )
     return parser.parse_args()
 
 
@@ -113,7 +135,29 @@ def _build_driver() -> webdriver.Chrome:
     return driver
 
 
-def _login(driver: webdriver.Chrome) -> None:
+def _default_wait() -> None:
+    """CLI default: print the two-tab instructions and block on Enter. A GUI
+    (or a test) supplies a different wait_fn — e.g. one that blocks on a
+    threading.Event instead — without _login() needing to know the difference."""
+    print(
+        "\n[ACTION REQUIRED] The Kobo sign-in page is open in your browser.\n"
+        "  Kobo's CAPTCHA blocks login on this tab — follow these steps:\n"
+        "\n"
+        "  1. Copy the URL from the address bar.\n"
+        "  2. Open a NEW TAB manually (Ctrl+T) and paste the URL.\n"
+        "  3. Log in with your credentials in that new tab.\n"
+        "  4. Navigate to your library (My Books → Books) and wait for\n"
+        "     the book grid to fully load.\n"
+        "  5. Come back here and press Enter to continue: ",
+        end="",
+        flush=True,
+    )
+    input()
+
+
+def _login(
+    driver: webdriver.Chrome, wait_fn: Callable[[], None] = _default_wait
+) -> None:
     """Log in to Kobo using a manual two-tab strategy to bypass hCaptcha.
 
     hCaptcha on authorize.kobo.com fingerprints the first Selenium-opened tab
@@ -129,20 +173,7 @@ def _login(driver: webdriver.Chrome) -> None:
     log.info("Opening Kobo sign-in page…")
     driver.get(KOBO_LOGIN_URL)
 
-    print(
-        "\n[ACTION REQUIRED] The Kobo sign-in page is open in your browser.\n"
-        "  Kobo's CAPTCHA blocks login on this tab — follow these steps:\n"
-        "\n"
-        "  1. Copy the URL from the address bar.\n"
-        "  2. Open a NEW TAB manually (Ctrl+T) and paste the URL.\n"
-        "  3. Log in with your credentials in that new tab.\n"
-        "  4. Navigate to your library (My Books → Books) and wait for\n"
-        "     the book grid to fully load.\n"
-        "  5. Come back here and press Enter to continue: ",
-        end="",
-        flush=True,
-    )
-    input()
+    wait_fn()
 
     # Switch to whichever tab the user last navigated to.
     driver.switch_to.window(driver.window_handles[-1])
@@ -236,11 +267,13 @@ def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str]]:
     return books
 
 
-def scrape_kobo(max_pages: Optional[int]) -> list[tuple[str, str, str]]:
+def scrape_kobo(
+    max_pages: Optional[int], wait_fn: Callable[[], None] = _default_wait
+) -> list[tuple[str, str, str]]:
     """Scrape all books from the Kobo library using a manual-login flow."""
     driver = _build_driver()
     try:
-        _login(driver)
+        _login(driver, wait_fn=wait_fn)
 
         # After login the user is already on the library page; capture the
         # locale-aware URL before navigating anywhere else.
@@ -311,12 +344,39 @@ def resolve_isbns(
 
 
 # ==========================
+# ENRICHMENT
+# ==========================
+
+
+def enrich_books(
+    records: list[tuple[str, str, Optional[str], str]],
+) -> list[tuple[str, str, Optional[str], str, EnrichmentResult]]:
+    total = len(records)
+    enriched = []
+
+    for idx, (title, author, isbn, cover) in enumerate(records, start=1):
+        upc_isbn10, ean_isbn13 = classify_identifier(isbn) if isbn else ("", "")
+        result = enrich_book(
+            title, author, ean_isbn13 or None, upc_isbn10 or None, cover
+        )
+        sleep_between_requests()
+
+        enriched.append((title, author, isbn, cover, result))
+
+        if idx % ENRICH_LOG_INTERVAL == 0 or idx == total:
+            log.info("Enrichment progress: %d/%d book(s) processed.", idx, total)
+
+    return enriched
+
+
+# ==========================
 # OUTPUT
 # ==========================
 
 
 def write_csv(
-    records: list[tuple[str, str, Optional[str], str]], output_dir: str
+    records: list[tuple[str, str, Optional[str], str, EnrichmentResult]],
+    output_dir: str,
 ) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
     path = _output_path(output_dir, f"kobo_to_libib_{timestamp}.csv")
@@ -324,24 +384,36 @@ def write_csv(
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=LIBIB_HEADERS)
         writer.writeheader()
-        for title, author, isbn, cover in records:
-            upc_isbn10, ean_isbn13 = classify_identifier(isbn) if isbn else ("", "")
+        for title, author, isbn, cover, enrichment in records:
+            if isbn:
+                upc_isbn10, ean_isbn13 = classify_identifier(isbn)
+            else:
+                upc_isbn10 = enrichment.isbn10 or ""
+                ean_isbn13 = enrichment.isbn13 or ""
             row = {h: "" for h in LIBIB_HEADERS}
             row["title"] = title
             row["creators"] = author
             row["upc_isbn10"] = upc_isbn10
             row["ean_isbn13"] = ean_isbn13
             row["tags"] = LIBIB_TYPE
-            row["notes"] = cover
+            row["description"] = enrichment.description or ""
+            row["publisher"] = enrichment.publisher or ""
+            row["publish_date"] = enrichment.publish_date or ""
+            row["length_of"] = enrichment.length_of or ""
+            row["group"] = enrichment.series_name or ""
+            row["notes"] = format_series_notes(
+                enrichment.series_name, enrichment.series_position, cover
+            )
             writer.writerow(row)
 
     return path
 
 
 def write_unresolved(
-    records: list[tuple[str, str, Optional[str], str]], output_dir: str
+    records: list[tuple[str, str, Optional[str], str, EnrichmentResult]],
+    output_dir: str,
 ) -> Optional[str]:
-    unresolved = [(t, a) for t, a, isbn, _ in records if not isbn]
+    unresolved = [(t, a) for t, a, isbn, _, _ in records if not isbn]
     if not unresolved:
         return None
 
@@ -362,20 +434,28 @@ def write_unresolved(
 # ==========================
 
 
-def main() -> None:
-    args = parse_args()
-
-    if args.pages is not None and args.pages < 1:
-        raise SystemExit("--pages must be 1 or greater.")
-
+def run(
+    *,
+    pages: Optional[int] = None,
+    dry_run: bool = False,
+    output_dir: str = ".",
+    no_enrich: bool = False,
+    wait_fn: Callable[[], None] = _default_wait,
+) -> RunResult:
+    """Scrape, resolve, enrich, and write — callable directly (CLI, reconciler,
+    or a future GUI) without going through argparse. `main()` below is a thin
+    wrapper around this for the CLI entry point.
+    """
     log.info("Starting Kobo library scrape…")
-    books = scrape_kobo(max_pages=args.pages)
+    books = scrape_kobo(max_pages=pages, wait_fn=wait_fn)
 
     books = filter_invalid_books(books)
 
     if not books:
         log.error("No books were scraped. Exiting.")
-        return
+        return RunResult(
+            csv_path=None, unresolved_path=None, total_books=0, resolved_count=0
+        )
 
     log.info("Found %d book(s). Deduplicating…", len(books))
     books = dedupe_books_by_title(books)
@@ -393,18 +473,57 @@ def main() -> None:
         unresolved_count,
     )
 
-    if args.dry_run:
-        log.info("--dry-run set — no output files written.")
-        return
+    if no_enrich:
+        log.info("--no-enrich set — skipping metadata/series enrichment.")
+        enriched = [
+            (t, a, isbn, cover, _NULL_ENRICHMENT) for t, a, isbn, cover in records
+        ]
+    else:
+        log.info(
+            "Enriching %d book(s) via Open Library / Google Books / Wikidata…",
+            len(records),
+        )
+        enriched = enrich_books(records)
 
-    csv_path = write_csv(records, args.output_dir)
+    if dry_run:
+        log.info("--dry-run set — no output files written.")
+        return RunResult(
+            csv_path=None,
+            unresolved_path=None,
+            total_books=len(records),
+            resolved_count=resolved,
+        )
+
+    csv_path = write_csv(enriched, output_dir)
     log.info("CSV written: %s", csv_path)
 
-    unresolved_path = write_unresolved(records, args.output_dir)
+    unresolved_path = write_unresolved(enriched, output_dir)
     if unresolved_path:
         log.info("Unresolved titles written to: %s", unresolved_path)
 
-    print(f"\nUpload '{csv_path}' to Libib to update your collection.")
+    return RunResult(
+        csv_path=csv_path,
+        unresolved_path=unresolved_path,
+        total_books=len(records),
+        resolved_count=resolved,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.pages is not None and args.pages < 1:
+        raise SystemExit("--pages must be 1 or greater.")
+
+    result = run(
+        pages=args.pages,
+        dry_run=args.dry_run,
+        output_dir=args.output_dir,
+        no_enrich=args.no_enrich,
+    )
+
+    if result.csv_path:
+        print(f"\nUpload '{result.csv_path}' to Libib to update your collection.")
 
 
 if __name__ == "__main__":

@@ -26,3 +26,15 @@ def test_kindle_cli_output_dir():
     with patch("sys.argv", ["prog", "--output-dir", "out"]):
         args = kindle_parse()
         assert args.output_dir == "out"
+
+
+def test_chirp_cli_no_enrich():
+    with patch("sys.argv", ["prog", "--no-enrich"]):
+        args = chirp_parse()
+        assert args.no_enrich is True
+
+
+def test_kindle_cli_no_enrich_default_false():
+    with patch("sys.argv", ["prog"]):
+        args = kindle_parse()
+        assert args.no_enrich is False

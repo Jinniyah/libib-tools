@@ -4,12 +4,22 @@ import tempfile
 from unittest.mock import MagicMock, patch
 
 from kobo_to_libib.core import (
+    RunResult,
     _parse_items,
     resolve_isbns,
+    run,
     write_csv,
     write_unresolved,
 )
-from lib import LIBIB_HEADERS, dedupe_books_by_title, filter_invalid_books
+from lib import (
+    EnrichmentResult,
+    LIBIB_HEADERS,
+    dedupe_books_by_title,
+    filter_invalid_books,
+)
+
+# Stand-in for a book with no enrichment data — matches --no-enrich output.
+EMPTY = EnrichmentResult()
 
 # ==========================
 # PARSE ITEMS
@@ -120,7 +130,7 @@ def test_resolve_isbns_unresolved(mock_sleep, mock_isbn):
 
 
 def test_write_csv_headers():
-    records = [("Dune", "Frank Herbert", "9781402894626", "cover")]
+    records = [("Dune", "Frank Herbert", "9781402894626", "cover", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         path = write_csv(records, tmp)
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -130,7 +140,13 @@ def test_write_csv_headers():
 
 def test_write_csv_isbn13_mapping():
     records = [
-        ("Dune", "Frank Herbert", "9781402894626", "http://cover.example.com/dune.jpg")
+        (
+            "Dune",
+            "Frank Herbert",
+            "9781402894626",
+            "http://cover.example.com/dune.jpg",
+            EMPTY,
+        )
     ]
     with tempfile.TemporaryDirectory() as tmp:
         path = write_csv(records, tmp)
@@ -145,7 +161,7 @@ def test_write_csv_isbn13_mapping():
 
 
 def test_write_csv_isbn10_mapping():
-    records = [("Dune", "Frank Herbert", "1402894627", "cover")]
+    records = [("Dune", "Frank Herbert", "1402894627", "cover", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         path = write_csv(records, tmp)
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -155,7 +171,7 @@ def test_write_csv_isbn10_mapping():
 
 
 def test_write_csv_no_isbn():
-    records = [("No ISBN Book", "Author", None, "")]
+    records = [("No ISBN Book", "Author", None, "", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         path = write_csv(records, tmp)
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -164,8 +180,32 @@ def test_write_csv_no_isbn():
     assert rows[0]["ean_isbn13"] == ""
 
 
+def test_write_csv_enrichment_mapping():
+    enrichment = EnrichmentResult(
+        description="Desert planet epic.",
+        publisher="Ace",
+        publish_date="1965",
+        length_of="412",
+        series_name="Dune Chronicles",
+        series_position=1,
+    )
+    records = [("Dune", "Frank Herbert", "9781402894626", "cover-url", enrichment)]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write_csv(records, tmp)
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+    assert rows[0]["description"] == "Desert planet epic."
+    assert rows[0]["publisher"] == "Ace"
+    assert rows[0]["publish_date"] == "1965"
+    assert rows[0]["length_of"] == "412"
+    assert rows[0]["group"] == "Dune Chronicles"
+    assert rows[0]["notes"] == (
+        "Series: Dune Chronicles #001 || Additional Notes: cover-url"
+    )
+
+
 def test_write_csv_empty_non_mapped_columns():
-    records = [("Dune", "Frank Herbert", "9781402894626", "cover")]
+    records = [("Dune", "Frank Herbert", "9781402894626", "cover", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         path = write_csv(records, tmp)
         with open(path, newline="", encoding="utf-8-sig") as f:
@@ -205,8 +245,8 @@ def test_write_csv_empty_non_mapped_columns():
 
 def test_write_unresolved_creates_file():
     records = [
-        ("Dune", "Frank Herbert", "9781402894626", "cover"),
-        ("Unknown Book", "Unknown Author", None, ""),
+        ("Dune", "Frank Herbert", "9781402894626", "cover", EMPTY),
+        ("Unknown Book", "Unknown Author", None, "", EMPTY),
     ]
     with tempfile.TemporaryDirectory() as tmp:
         path = write_unresolved(records, tmp)
@@ -218,8 +258,54 @@ def test_write_unresolved_creates_file():
         assert "Dune" not in text
 
 
+# ==========================
+# run() — callable directly, no argparse (REFACTOR-6)
+# ==========================
+
+
+@patch("kobo_to_libib.core.write_unresolved", return_value=None)
+@patch("kobo_to_libib.core.write_csv", return_value="/out/kobo_to_libib_x.csv")
+@patch("kobo_to_libib.core.enrich_book", return_value=EMPTY)
+@patch("kobo_to_libib.core.sleep_between_requests")
+@patch("kobo_to_libib.core.get_isbn", return_value="9781402894626")
+@patch("kobo_to_libib.core.scrape_kobo")
+def test_run_returns_paths_and_counts(
+    mock_scrape,
+    mock_get_isbn,
+    mock_sleep,
+    mock_enrich_book,
+    mock_write_csv,
+    mock_write_unresolved,
+):
+    mock_scrape.return_value = [("Dune", "Frank Herbert", "cover")]
+
+    result = run(output_dir="/out")
+
+    assert result.csv_path == "/out/kobo_to_libib_x.csv"
+    assert result.total_books == 1
+    assert result.resolved_count == 1
+
+
+@patch("kobo_to_libib.core.scrape_kobo", return_value=[])
+def test_run_no_books_scraped_returns_empty_result(mock_scrape):
+    result = run()
+    assert result == RunResult(
+        csv_path=None, unresolved_path=None, total_books=0, resolved_count=0
+    )
+
+
+@patch("kobo_to_libib.core.scrape_kobo", return_value=[])
+def test_run_passes_wait_fn_through_to_scrape(mock_scrape):
+    def my_wait() -> None:
+        pass
+
+    run(wait_fn=my_wait)
+
+    mock_scrape.assert_called_once_with(max_pages=None, wait_fn=my_wait)
+
+
 def test_write_unresolved_returns_none_when_all_resolved():
-    records = [("Dune", "Frank Herbert", "9781402894626", "cover")]
+    records = [("Dune", "Frank Herbert", "9781402894626", "cover", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         result = write_unresolved(records, tmp)
     assert result is None

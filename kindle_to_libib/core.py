@@ -6,13 +6,17 @@ import getpass
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 from collections.abc import Iterable
 
 from lib import (
     LIBIB_HEADERS,
+    EnrichmentResult,
     classify_identifier,
+    enrich_book,
+    format_series_notes,
     get_isbn,
     sleep_between_requests,
     dedupe_books_by_title,
@@ -33,8 +37,21 @@ from webdriver_manager.chrome import ChromeDriverManager
 # ==========================
 
 ISBN_LOG_INTERVAL: int = 25
+ENRICH_LOG_INTERVAL: int = 25
 PAGE_WAIT_TIMEOUT: int = 20
 LIBIB_TYPE = "kindle,ebook"
+
+# Used in place of a real EnrichmentResult when --no-enrich is set.
+_NULL_ENRICHMENT = EnrichmentResult()
+
+
+@dataclass
+class RunResult:
+    csv_path: Optional[str]
+    unresolved_path: Optional[str]
+    total_books: int
+    resolved_count: int
+
 
 KINDLE_LIBRARY_URL: str = (
     "https://www.amazon.com/hz/mycd/digital-console/contentlist/booksAll/dateDsc/"
@@ -67,6 +84,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pages", type=int, default=None, metavar="N")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-dir", default=".", metavar="PATH")
+    parser.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="Skip metadata/series enrichment (faster, no extra HTTP calls).",
+    )
     return parser.parse_args()
 
 
@@ -322,6 +344,32 @@ def resolve_isbns(
 
 
 # ==========================
+# ENRICHMENT
+# ==========================
+
+
+def enrich_books(
+    records: list[tuple[str, str, Optional[str], str]],
+) -> list[tuple[str, str, Optional[str], str, EnrichmentResult]]:
+    total = len(records)
+    enriched = []
+
+    for idx, (title, author, isbn, cover) in enumerate(records, start=1):
+        upc_isbn10, ean_isbn13 = classify_identifier(isbn) if isbn else ("", "")
+        result = enrich_book(
+            title, author, ean_isbn13 or None, upc_isbn10 or None, cover
+        )
+        sleep_between_requests()
+
+        enriched.append((title, author, isbn, cover, result))
+
+        if idx % ENRICH_LOG_INTERVAL == 0 or idx == total:
+            log.info("Enrichment progress: %d/%d book(s) processed.", idx, total)
+
+    return enriched
+
+
+# ==========================
 # OUTPUT
 # ==========================
 
@@ -331,7 +379,8 @@ def resolve_isbns(
 
 
 def write_csv(
-    records: list[tuple[str, str, Optional[str], str]], output_dir: str
+    records: list[tuple[str, str, Optional[str], str, EnrichmentResult]],
+    output_dir: str,
 ) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
     path = _output_path(output_dir, f"kindle_to_libib_{timestamp}.csv")
@@ -339,24 +388,36 @@ def write_csv(
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=LIBIB_HEADERS)
         writer.writeheader()
-        for title, author, isbn, cover in records:
-            upc_isbn10, ean_isbn13 = classify_identifier(isbn) if isbn else ("", "")
+        for title, author, isbn, cover, enrichment in records:
+            if isbn:
+                upc_isbn10, ean_isbn13 = classify_identifier(isbn)
+            else:
+                upc_isbn10 = enrichment.isbn10 or ""
+                ean_isbn13 = enrichment.isbn13 or ""
             row = {h: "" for h in LIBIB_HEADERS}
             row["title"] = title
             row["creators"] = author
             row["upc_isbn10"] = upc_isbn10
             row["ean_isbn13"] = ean_isbn13
             row["tags"] = LIBIB_TYPE
-            row["notes"] = cover
+            row["description"] = enrichment.description or ""
+            row["publisher"] = enrichment.publisher or ""
+            row["publish_date"] = enrichment.publish_date or ""
+            row["length_of"] = enrichment.length_of or ""
+            row["group"] = enrichment.series_name or ""
+            row["notes"] = format_series_notes(
+                enrichment.series_name, enrichment.series_position, cover
+            )
             writer.writerow(row)
 
     return path
 
 
 def write_unresolved(
-    records: list[tuple[str, str, Optional[str], str]], output_dir: str
+    records: list[tuple[str, str, Optional[str], str, EnrichmentResult]],
+    output_dir: str,
 ) -> Optional[str]:
-    unresolved = [(t, a) for t, a, isbn, _ in records if not isbn]
+    unresolved = [(t, a) for t, a, isbn, _, _ in records if not isbn]
     if not unresolved:
         return None
 
@@ -383,15 +444,27 @@ def _filter_kindle_books(
     return filter_invalid_books(books, extra_garbage=_KINDLE_UI_GARBAGE)
 
 
-def main() -> None:
-    args = parse_args()
-    if args.pages is not None and args.pages < 1:
-        raise SystemExit("--pages must be 1 or greater.")
+def run(
+    *,
+    pages: Optional[int] = None,
+    dry_run: bool = False,
+    output_dir: str = ".",
+    no_enrich: bool = False,
+) -> RunResult:
+    """Scrape, resolve, enrich, and write — callable directly (CLI, reconciler,
+    or a future GUI) without going through argparse. `main()` below is a thin
+    wrapper around this for the CLI entry point.
 
+    Credentials are read the same way regardless of caller: env vars first,
+    falling back to an interactive prompt only if unset — see
+    _prompt_credentials(). No email/password parameters here on purpose;
+    credentials stay env-var/prompt-only, never passed through as plain
+    function arguments from a GUI layer.
+    """
     email, password = _prompt_credentials()
 
     log.info("Starting Kindle library scrape…")
-    books = scrape_kindle(email, password, max_pages=args.pages)
+    books = scrape_kindle(email, password, max_pages=pages)
 
     # Clear credentials from memory and environment as soon as the scrape completes
     del email, password
@@ -404,7 +477,9 @@ def main() -> None:
 
     if not books:
         log.error("No books were scraped. Exiting.")
-        return
+        return RunResult(
+            csv_path=None, unresolved_path=None, total_books=0, resolved_count=0
+        )
 
     log.info("Found %d book(s). Resolving ISBNs via Open Library…", len(books))
     records = resolve_isbns(books)
@@ -419,15 +494,53 @@ def main() -> None:
         unresolved_count,
     )
 
-    if args.dry_run:
-        log.info("--dry-run set — no output files written.")
-        return
+    if no_enrich:
+        log.info("--no-enrich set — skipping metadata/series enrichment.")
+        enriched = [
+            (t, a, isbn, cover, _NULL_ENRICHMENT) for t, a, isbn, cover in records
+        ]
+    else:
+        log.info(
+            "Enriching %d book(s) via Open Library / Google Books / Wikidata…",
+            len(records),
+        )
+        enriched = enrich_books(records)
 
-    csv_path = write_csv(records, args.output_dir)
+    if dry_run:
+        log.info("--dry-run set — no output files written.")
+        return RunResult(
+            csv_path=None,
+            unresolved_path=None,
+            total_books=len(records),
+            resolved_count=resolved,
+        )
+
+    csv_path = write_csv(enriched, output_dir)
     log.info("CSV written: %s", csv_path)
 
-    unresolved_path = write_unresolved(records, args.output_dir)
+    unresolved_path = write_unresolved(enriched, output_dir)
     if unresolved_path:
         log.info("Unresolved titles written to: %s", unresolved_path)
 
-    print(f"\nUpload '{csv_path}' to Libib to update your collection.")
+    return RunResult(
+        csv_path=csv_path,
+        unresolved_path=unresolved_path,
+        total_books=len(records),
+        resolved_count=resolved,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    if args.pages is not None and args.pages < 1:
+        raise SystemExit("--pages must be 1 or greater.")
+
+    result = run(
+        pages=args.pages,
+        dry_run=args.dry_run,
+        output_dir=args.output_dir,
+        no_enrich=args.no_enrich,
+    )
+
+    if result.csv_path:
+        print(f"\nUpload '{result.csv_path}' to Libib to update your collection.")
