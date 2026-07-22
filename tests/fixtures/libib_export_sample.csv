@@ -1,0 +1,16 @@
+﻿item_type,title,creators,first_name,last_name,collection,ean_isbn13,upc_isbn10,description,publisher,publish_date,group,tags,notes,price,length,number_of_discs,number_of_players,age_group,ensemble,aspect_ratio,esrb,rating,review,review_date,status,began,completed,added,copies
+book,Project Hail Mary,Andy Weir,,,Books,9780593135204,,,,,,"digital, kindle",,,,,,,,,,,,,,,,,1
+book,The Fifth Season,N.K. Jemisin,,,Books,,,,,,,"digital, kobo",,,,,,,,,,,,,,,,,1
+book,Mistborn: The Final Empire,Brandon Sanderson,,,Books,9780765350381,,,,,,"digital, kindle, kobo",,,,,,,,,,,,,,,,,1
+book,The Name of the Wind,Patrick Rothfuss,,,Books,,,,,,,"audiobook, chirp",,,,,,,,,,,,,,,,,1
+book,Piranesi,Susanna Clarke,,,Books,9781635575637,,,,,,"chirp, digital, kindle, nook",,,,,,,,,,,,,,,,,1
+book,Unknown Platform Book,Some Author,,,Books,,,,,,,digital,,,,,,,,,,,,,,,,,1
+book,Deleted Book,Nobody,,,Books,,,,,,,"deleted, digital, kindle",,,,,,,,,,,,,,,,,1
+book,Removed Book,Nobody,,,Books,,,,,,,removed,,,,,,,,,,,,,,,,,1
+book,Physical Paperback,Physical Author,,,Books,,,,,,,"new, paperback",,,,,,,,,,,,,,,,,1
+book,Case Test Book,Case Author,,,Books,,,,,,,"Digital, Kindle",,,,,,,,,,,,,,,,,1
+book,Old Hardback,Old Author,,,Books,,,,,,,"hardback, used",,,,,,,,,,,,,,,,,1
+book,No Tags Book,Tagless Author,,,Books,,,,,,,,,,,,,,,,,,,,,,,,1
+book,Nook Exclusive,Nook Author,,,Books,9780593813867,,,,,,"digital, nook",,,,,,,,,,,,,,,,,1
+book,Digital Plus Physical,Combo Author,,,Books,,,,,,,"digital, kindle, new, hardback",,,,,,,,,,,,,,,,,1
+book,Google Books Entry,Google Author,,,Books,,,,,,,"digital, google",,,,,,,,,,,,,,,,,1

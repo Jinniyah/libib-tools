@@ -5,6 +5,8 @@
 *.vsidx
 # Output CSV files are personal library data — do not commit
 *.csv
+# ...except committed test fixtures, which are synthetic and reviewable
+!tests/fixtures/*.csv
 *.pyc
 *.pyo
 *.pyd
