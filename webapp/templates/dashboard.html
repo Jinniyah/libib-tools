@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard — LibibTools{% endblock %}
+
+{% block content %}
+<h1>LibibTools</h1>
+<p>Scrape your digital book libraries and export Libib-compatible CSVs, then reconcile against your existing Libib collection.</p>
+
+<section aria-label="Providers" class="grid">
+  {% for tool in tools %}
+  <article class="card" data-tool="{{ tool.slug }}" data-enabled="{{ tool.enabled | lower }}">
+    <h2>
+      {{ tool.name }}
+      {% if tool.slug in statuses %}
+        <span class="badge badge-status-{{ statuses[tool.slug] }}" data-last-status="{{ statuses[tool.slug] }}">{{ statuses[tool.slug] }}</span>
+      {% endif %}
+    </h2>
+    <p>{{ tool.description }}</p>
+    {% if tool.enabled %}
+      <a class="btn" href="/scrape/{{ tool.slug }}">Run {{ tool.name }}</a>
+    {% else %}
+      <span class="badge">Coming soon</span>
+    {% endif %}
+  </article>
+  {% endfor %}
+</section>
+{% endblock %}

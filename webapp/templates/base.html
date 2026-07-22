@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}LibibTools{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}">
+</head>
+<body>
+  <header class="site-header">
+    <a href="/"><strong>LibibTools</strong></a>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="site-footer">
+    <p>Runs locally at <code>127.0.0.1</code> — nothing here talks to the outside world except the providers you scrape and (if enabled) the AI metadata fallback.</p>
+  </footer>
+</body>
+</html>

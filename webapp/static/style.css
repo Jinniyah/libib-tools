@@ -1,0 +1,354 @@
+/* webapp/static/style.css
+ *
+ * The *only* stylesheet for the whole app — every page shares it, no
+ * per-page CSS. Design tokens (custom properties) first, then layout, then
+ * reusable components (.card, .btn, .badge, .log-panel, forms).
+ */
+
+:root {
+  --color-bg: #ffffff;
+  --color-surface: #f9fafb;
+  --color-text: #1a1a1a;
+  --color-muted: #6b7280;
+  --color-primary: #2563eb;
+  --color-primary-hover: #1d4ed8;
+  --color-border: #e5e7eb;
+  --color-disabled-bg: #f3f4f6;
+  --color-disabled-text: #9ca3af;
+
+  --color-success: #16a34a;
+  --color-success-bg: #dcfce7;
+  --color-warning: #b45309;
+  --color-warning-bg: #fef3c7;
+  --color-danger: #dc2626;
+  --color-danger-bg: #fee2e2;
+  --color-info: #2563eb;
+  --color-info-bg: #dbeafe;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 1rem;
+  --space-4: 1.5rem;
+  --space-6: 2.5rem;
+
+  --radius: 0.5rem;
+  --radius-sm: 0.25rem;
+  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+
+  --max-width: 60rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #0f172a;
+    --color-surface: #1e293b;
+    --color-text: #e5e7eb;
+    --color-muted: #94a3b8;
+    --color-primary: #60a5fa;
+    --color-primary-hover: #93c5fd;
+    --color-border: #334155;
+    --color-disabled-bg: #1e293b;
+    --color-disabled-text: #64748b;
+
+    --color-success: #4ade80;
+    --color-success-bg: #14532d;
+    --color-warning: #fbbf24;
+    --color-warning-bg: #451a03;
+    --color-danger: #f87171;
+    --color-danger-bg: #450a0a;
+    --color-info: #60a5fa;
+    --color-info-bg: #1e3a5f;
+  }
+}
+
+/* The viewer's theme toggle (if any) stamps data-theme on <html>, and it
+   wins over the OS-level prefers-color-scheme signal either direction. */
+:root[data-theme="dark"] {
+  --color-bg: #0f172a;
+  --color-surface: #1e293b;
+  --color-text: #e5e7eb;
+  --color-muted: #94a3b8;
+  --color-primary: #60a5fa;
+  --color-primary-hover: #93c5fd;
+  --color-border: #334155;
+  --color-disabled-bg: #1e293b;
+  --color-disabled-text: #64748b;
+  --color-success: #4ade80;
+  --color-success-bg: #14532d;
+  --color-warning: #fbbf24;
+  --color-warning-bg: #451a03;
+  --color-danger: #f87171;
+  --color-danger-bg: #450a0a;
+  --color-info: #60a5fa;
+  --color-info-bg: #1e3a5f;
+}
+
+:root[data-theme="light"] {
+  --color-bg: #ffffff;
+  --color-surface: #f9fafb;
+  --color-text: #1a1a1a;
+  --color-muted: #6b7280;
+  --color-primary: #2563eb;
+  --color-primary-hover: #1d4ed8;
+  --color-border: #e5e7eb;
+  --color-disabled-bg: #f3f4f6;
+  --color-disabled-text: #9ca3af;
+  --color-success: #16a34a;
+  --color-success-bg: #dcfce7;
+  --color-warning: #b45309;
+  --color-warning-bg: #fef3c7;
+  --color-danger: #dc2626;
+  --color-danger-bg: #fee2e2;
+  --color-info: #2563eb;
+  --color-info-bg: #dbeafe;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light dark;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-bg);
+  color: var(--color-text);
+  margin: 0;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--color-primary);
+}
+
+a:hover {
+  color: var(--color-primary-hover);
+}
+
+h1, h2, h3 {
+  line-height: 1.25;
+}
+
+/* ==========================
+   Layout
+   ========================== */
+
+.site-header {
+  border-bottom: 1px solid var(--color-border);
+  padding: var(--space-3) var(--space-4);
+}
+
+.site-header a {
+  text-decoration: none;
+  font-size: 1.1rem;
+}
+
+main {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: var(--space-4);
+}
+
+.site-footer {
+  max-width: var(--max-width);
+  margin: var(--space-6) auto 0;
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border);
+  color: var(--color-muted);
+  font-size: 0.875rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: var(--space-3);
+}
+
+/* ==========================
+   Card
+   ========================== */
+
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.card[data-enabled="false"] {
+  opacity: 0.7;
+}
+
+.card h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.card p {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.9rem;
+  flex-grow: 1;
+}
+
+/* ==========================
+   Buttons
+   ========================== */
+
+.btn {
+  display: inline-block;
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  text-decoration: none;
+  text-align: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  background: var(--color-primary);
+  color: #ffffff;
+}
+
+.btn:hover {
+  background: var(--color-primary-hover);
+  color: #ffffff;
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  background: var(--color-disabled-bg);
+  color: var(--color-disabled-text);
+}
+
+.btn-secondary {
+  background: transparent;
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+.btn-secondary:hover {
+  background: var(--color-disabled-bg);
+  color: var(--color-text);
+}
+
+.btn-danger {
+  background: var(--color-danger);
+}
+
+.btn-danger:hover {
+  background: var(--color-danger);
+  filter: brightness(1.1);
+}
+
+/* ==========================
+   Badge (job/provider status)
+   ========================== */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: var(--color-disabled-bg);
+  color: var(--color-muted);
+}
+
+.badge-info {
+  background: var(--color-info-bg);
+  color: var(--color-info);
+}
+
+.badge-success {
+  background: var(--color-success-bg);
+  color: var(--color-success);
+}
+
+.badge-warning {
+  background: var(--color-warning-bg);
+  color: var(--color-warning);
+}
+
+.badge-danger {
+  background: var(--color-danger-bg);
+  color: var(--color-danger);
+}
+
+/* Status → badge color mapping, so templates can just do
+   class="badge badge-status-{{ job.status }}" without a Jinja if/elif chain. */
+.badge-status-queued,
+.badge-status-waiting_for_login { }
+.badge-status-queued { background: var(--color-disabled-bg); color: var(--color-muted); }
+.badge-status-waiting_for_login { background: var(--color-warning-bg); color: var(--color-warning); }
+.badge-status-running { background: var(--color-info-bg); color: var(--color-info); }
+.badge-status-completed { background: var(--color-success-bg); color: var(--color-success); }
+.badge-status-failed { background: var(--color-danger-bg); color: var(--color-danger); }
+.badge-status-cancelled { background: var(--color-disabled-bg); color: var(--color-muted); }
+
+/* ==========================
+   Log panel (live scrape/reconcile output)
+   ========================== */
+
+.log-panel {
+  background: #0b1120;
+  color: #d1d5db;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  line-height: 1.4;
+  padding: var(--space-3);
+  border-radius: var(--radius);
+  height: 20rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ==========================
+   Forms
+   ========================== */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-bottom: var(--space-3);
+}
+
+.field label {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.field input[type="text"],
+.field input[type="number"],
+.field select {
+  font-family: inherit;
+  font-size: 1rem;
+  padding: var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
+.field-checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.field-hint {
+  color: var(--color-muted);
+  font-size: 0.8rem;
+}

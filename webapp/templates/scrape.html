@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{% block title %}{{ tool.name }} — LibibTools{% endblock %}
+
+{% block content %}
+<p><a href="/">&larr; Back to dashboard</a></p>
+<h1>{{ tool.name }}</h1>
+<p>{{ tool.description }}</p>
+
+<form id="scrape-form" data-provider="{{ tool.slug }}">
+  <div class="field">
+    <label for="pages">Pages</label>
+    <input type="number" id="pages" name="pages" min="1" placeholder="All pages">
+    <span class="field-hint">Leave blank to scrape everything.</span>
+  </div>
+
+  <div class="field">
+    <label for="output_dir">Output directory</label>
+    <input type="text" id="output_dir" name="output_dir" value=".">
+  </div>
+
+  <div class="field field-checkbox">
+    <input type="checkbox" id="dry_run" name="dry_run">
+    <label for="dry_run">Dry run (resolve ISBNs, don't write files)</label>
+  </div>
+
+  <div class="field field-checkbox">
+    <input type="checkbox" id="no_enrich" name="no_enrich">
+    <label for="no_enrich">Skip enrichment (faster, no extra HTTP calls)</label>
+  </div>
+
+  <button type="submit" class="btn" id="start-btn">Start scrape</button>
+</form>
+
+<section id="job-panel" hidden>
+  <h2>Status: <span id="job-status" class="badge">queued</span></h2>
+
+  <div id="login-wait" hidden class="card">
+    <p>A browser window has opened for manual login. Log in there, then come back and click Continue.</p>
+    <button type="button" class="btn" id="continue-btn">Continue</button>
+    <button type="button" class="btn btn-danger" id="cancel-btn">Cancel</button>
+  </div>
+
+  <div class="log-panel" id="log-panel"></div>
+
+  <div id="job-result" hidden>
+    <h2>Result</h2>
+    <p id="job-result-summary"></p>
+    <div id="job-downloads"></div>
+  </div>
+</section>
+
+<script src="{{ url_for('static', path='/app.js') }}"></script>
+<script>
+  initScrapePage();
+</script>
+{% endblock %}
