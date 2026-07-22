@@ -6,19 +6,36 @@ authors = [{ name = "Jennifer M" }]
 requires-python = ">=3.10"
 
 [tool.setuptools]
-packages = ["chirp_to_libib", "kindle_to_libib", "kobo_to_libib", "lib"]
+packages = [
+    "chirp_to_libib",
+    "kindle_to_libib",
+    "kobo_to_libib",
+    "nook_to_libib",
+    "libib_reconcile",
+    "webapp",
+    "lib",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["chirp_to_libib"]
+source = ["chirp_to_libib", "nook_to_libib", "libib_reconcile", "webapp"]
 omit = [
     "chirp_to_libib/__main__.py",
     "chirp_to_libib/core.py:_build_driver",
     "chirp_to_libib/core.py:_login",
     "chirp_to_libib/core.py:scrape_chirp",
     "chirp_to_libib/core.py:main",
+    "nook_to_libib/__main__.py",
+    "nook_to_libib/core.py:_build_driver",
+    "nook_to_libib/core.py:_login",
+    "nook_to_libib/core.py:scrape_nook",
+    "nook_to_libib/core.py:main",
+    "libib_reconcile/__main__.py",
+    "libib_reconcile/core.py:main",
+    "webapp/__main__.py",
+    "webapp/main.py",
 ]
 
 [tool.ruff]

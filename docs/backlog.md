@@ -5,11 +5,13 @@
 LibibTools is a **public, community-facing tool** on GitHub (`Jinniyah/libib-tools`).
 It scrapes personal digital book libraries and exports Libib-compatible CSVs.
 
-This backlog covers two workstreams:
+This backlog covers three workstreams:
 
-1. **New scrapers** — `nook_to_libib` (Selenium + manual login) and
+1. **Metadata enrichment** — `lib/enricher.py`: fills missing fields and resolves
+   series data for all scrapers
+2. **New scrapers** — `nook_to_libib` (Selenium + manual login) and
    `google_to_libib` (Google Books API + OAuth 2.0)
-2. **`libib_reconcile`** — compares a Libib export against scrapes from all five
+3. **`libib_reconcile`** — compares a Libib export against scrapes from all five
    providers, identifies missing books, enriches with ISBNs, and produces a
    ready-to-import gap CSV plus human-readable reports
 
@@ -32,12 +34,19 @@ For architectural context, tag schema findings, and data model decisions, see
 
 ## Session Plan
 
+### Metadata Enrichment
+
+| Session | Module | Goal |
+|---------|--------|------|
+| **Enrich-1** | `lib/enricher.py` | Core enricher: Open Library + Google Books metadata; Wikidata series lookup |
+| **Enrich-2** | All scrapers | Wire enricher into all five scraper pipelines; tests; CI |
+
 ### New Scrapers
 
 | Session | Module | Goal |
 |---------|--------|------|
-| **Nook-1** | `nook_to_libib` | Scaffold module; manual login flow; Selenium scraping of bn.com digital library; CSV output. Needs DOM screenshot first. |
-| **Nook-2** | `nook_to_libib` | Tests, CI, README section, add `nook` to reconciler provider list |
+| **Nook-1** | `nook_to_libib` | ✅ Complete — scaffold, manual login, ISBN-from-DOM scraping, enrichment wired in from the start |
+| **Nook-2** | `nook_to_libib` | ✅ Complete — tests, CI, README section. Reconciler provider-tag update deferred until `libib_reconcile` is scaffolded (Rec-1) |
 | **Google-1** | `google_to_libib` | OAuth 2.0 setup guide; API client; paginate Purchased shelf (ID 7); CSV output |
 | **Google-2** | `google_to_libib` | Tests, CI, README section, add `google` to reconciler provider list |
 
@@ -46,10 +55,36 @@ For architectural context, tag schema findings, and data model decisions, see
 | Session | Epics | Goal |
 |---------|-------|------|
 | **Rec-1** | Epic 1 + scaffolding | Parse Libib export; tag normalization; provider classification; filters. By end: can load and classify the real export. |
-| **Rec-2** | Epic 2 | Matching engine: ISBN-exact first, then fuzzy fallback with confidence scoring. |
-| **Rec-3** | Epics 3 + 4 | ISBN enrichment for gap books + all output files (gap CSV + reports). |
-| **Rec-4** | Epics 5 + 6 | CLI, full test suite, CI integration. `python -m libib_reconcile` works. |
+| **Rec-2** | Epic 2 | ✅ Complete — matching engine: ISBN-exact first (provider-agnostic), fuzzy fallback (provider-scoped, greedy) with confidence scoring. |
+| **Rec-3** | Epics 3 + 4 | ✅ Complete — ISBN enrichment for gap books + all output files (gap CSV + 4 reports). |
+| **Rec-4a** | Refactor | ✅ Complete — extracted `run()` from `main()` in all four scrapers' `core.py`; added `wait_fn` param to Chirp/Kobo/Nook `_login()`. Enables `--scrape` to call scrapers in-process instead of shelling out, and lets the future GUI reuse the same entry points. |
+| **Rec-4** | Epics 5 + 6 | ✅ Complete — CLI (using the new `run()` entry points), full test suite (232 total, 87% coverage), CI integration. `python -m libib_reconcile` works — verified end-to-end. |
 | **Rec-5** | Integration | Run against real data; tune thresholds; polish. |
+
+### Web GUI
+
+A local web app (`webapp/`) wrapping all four scrapers plus the reconciler —
+portfolio-quality, security/maintainability-conscious. **Depends on Rec-4a**
+(the `run()`/`wait_fn` refactor) and benefits from the reconciler being complete,
+so this work starts after the Reconciler sessions above. Full architecture and
+ticket breakdown in the `## Web GUI (webapp)` section below.
+
+| Session | Goal |
+|---------|------|
+| **GUI-Backend-1** | ✅ Complete — `webapp/` skeleton, app factory, `127.0.0.1` binding, dashboard route w/ tool cards + disabled Google placeholder |
+| **GUI-Backend-2** | ✅ Complete — job registry + runner (thread-based, in-memory) |
+| **GUI-Backend-3** | ✅ Complete — log bridge + Server-Sent Events streaming |
+| **GUI-Backend-4** | ✅ Complete (Tier 1) — manual-login wait/continue/cancel wiring; Tier-2 force-stop deferred, see `GUI-BACKEND-4a` follow-up |
+| **GUI-Backend-5** | ✅ Complete — scraper dispatch endpoints + safe downloads |
+| **GUI-Frontend-1** | ✅ Complete — shared `static/style.css` design system + base layout |
+| **GUI-Frontend-2** | ✅ Complete except the Reconcile card (needs `/reconcile`, lands with GUI-Reconcile-1) — dashboard page, real tool explanations, live status badges |
+| **GUI-Frontend-3** | ✅ Complete — run-a-scraper page, form, live log, manual-login UI. **Not browser-verified — action item for you.** |
+| **GUI-Reconcile-1** | Libib CSV upload handling (validated, safe) |
+| **GUI-Reconcile-2** | Reconcile job wiring (reuses job/SSE infra) |
+| **GUI-Reconcile-3** | Reconciliation results page + downloads |
+| **GUI-Settings-1** | Read-only credential/env-var status page |
+| **GUI-Security-1** | CSRF (Origin-check), path-traversal sweep, shutdown cleanup review |
+| **GUI-Polish-1** | README, `docs/CLAUDE.md`, coverage config |
 
 ---
 
@@ -63,40 +98,229 @@ For architectural context, tag schema findings, and data model decisions, see
 
 ---
 
-## Nook Scraper (`nook_to_libib`)
+## Metadata Enrichment (`lib/enricher.py`)
 
-**Approach:** Selenium + manual login pause (same pattern as Chirp and Kobo).
-B&N uses Akamai bot detection — do not attempt to automate login.
-Library URL: `https://www.barnesandnoble.com/account/my-digital-library`
+### Overview
 
-**⚠️ Before starting Nook-1:** Need a DevTools screenshot of the bn.com digital
-library DOM (same as the Kobo screenshot that revealed `li.item-wrapper.book`).
-Ask Jennifer to open the library page in Chrome, inspect an element, and share
-a screenshot of the Elements panel.
+A new shared enrichment stage runs after ISBN resolution in every scraper pipeline,
+before `write_csv()`. It fills fields that scrapers leave blank and resolves series
+information from external sources.
+
+**Fields populated by enrichment:**
+
+| Libib column | Source(s) | Notes |
+|--------------|-----------|-------|
+| `ean_isbn13` | Open Library, Google Books | Only filled if still missing after scraper |
+| `upc_isbn10` | Open Library, Google Books | Only filled if still missing after scraper |
+| `description` | Open Library, Google Books | Prefer Open Library; fall back to Google Books |
+| `publisher` | Open Library, Google Books | Same preference order |
+| `publish_date` | Open Library, Google Books | Same preference order |
+| `length_of` | Open Library (`number_of_pages`) | Page count |
+| `price` | Kept if already present in data; not fetched | No reliable free source |
+| `group` | Wikidata series lookup | Series name; blank if not a series |
+| `notes` | Series position prepended | See format below |
+
+**Series notes format:**
+- Series found, position known: `Series: The Dragon Knight #009 || Additional Notes: <original>`
+- Series found, position unknown: `Series: The Dragon Knight #ZZZ || Additional Notes: <original>`
+- Not a series: `notes` field unchanged
+
+**Lookup sources and fallback chain:**
+
+For metadata (description, publisher, publish_date, length_of, missing ISBNs):
+```
+Open Library (by ISBN if available, else title+author search)
+  → Google Books Metadata API (no auth, free)
+  → AI provider fallback (optional, env-var enabled — see AI Fallback section)
+  → leave blank
+```
+
+**AI fallback is metadata-only.** It never runs for series/`group` resolution —
+that stays Wikidata-only with `#ZZZ` for unknown positions, per the earlier
+decision that LLM-based series guesses risk silent hallucination.
+
+For series data:
+```
+Wikidata SPARQL (by ISBN-13 if available, else title+author)
+  → leave group blank; stamp notes with #ZZZ if Wikidata confirms series but lacks position
+  → if Wikidata has no series record at all: group and notes unchanged
+```
+
+**Important:** The Google Books Metadata API (public, no OAuth) is distinct from the
+Google Books Library API (OAuth, used by `google_to_libib`). Enrichment uses only
+the public metadata endpoint — no credentials required.
+
+**Price:** If `price` is already populated in the scrape data, keep it. Do not fetch
+price from any external source — coverage from free APIs is too low to be useful.
+
+### Enrich-1 — Core enricher (`lib/enricher.py`)
+
+- [x] `ENR-1` Define `EnrichmentResult` dataclass:
+  `isbn13, isbn10, description, publisher, publish_date, length_of, series_name, series_position`
+  (all `str | None`; `series_position` is the raw integer or `None`)
+- [x] `ENR-2` `_fetch_open_library(isbn13, title, author) -> dict` — call Open Library
+  Works API; extract description, publisher, publish_date, number_of_pages, isbn_10/isbn_13.
+  Prefer ISBN lookup (`/works/{id}.json` + `/editions`); fall back to title+author search.
+  Use existing `sleep_between_requests()` from `lib`.
+- [x] `ENR-3` `_fetch_google_books_metadata(isbn13, title, author) -> dict` — call
+  `https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}` (or `intitle+inauthor`);
+  extract description, publisher, publishedDate, pageCount. No auth required.
+  Use `sleep_between_requests()`.
+- [x] `ENR-4` `_fetch_wikidata_series(isbn13, title, author) -> tuple[str | None, int | None]` —
+  SPARQL query against `https://query.wikidata.org/sparql`. Query by ISBN-13 first
+  (`wdt:P212`); fall back to title+author match. Extract series name (`wdt:P179 → label`)
+  and series ordinal (`wdt:P1545`). Return `(series_name, position_int)` or `(None, None)`.
+- [x] `ENR-5` `enrich_book(title, author, isbn13, isbn10, existing_notes) -> EnrichmentResult` —
+  orchestrates ENR-2 → ENR-3 → ENR-4; merges results with source preference (Open Library
+  over Google Books for metadata fields); returns a single `EnrichmentResult`.
+- [x] `ENR-6` `format_series_notes(series_name, series_position, existing_notes) -> str` —
+  pure function; formats the notes prefix. Position zero-padded to 3 digits (`{pos:03d}`).
+  If `series_name` is not None and `series_position` is None, uses `#ZZZ`.
+  If `series_name` is None, returns `existing_notes` unchanged.
+- [x] `ENR-7` Export `enrich_book` and `format_series_notes` from `lib/__init__.py`
+- [x] `ENR-8` `tests/test_enricher.py` — unit tests with mocked HTTP:
+  - Open Library hit: all fields populated
+  - Open Library miss → Google Books hit: correct fallback behaviour
+  - Both miss: `EnrichmentResult` all-None (no crash)
+  - Wikidata series hit with position: notes formatted correctly
+  - Wikidata series hit without position: `#ZZZ` stamp
+  - Wikidata miss: notes unchanged
+  - `format_series_notes` edge cases: position 1, 99, 100, None, existing notes present,
+    existing notes empty
+- [x] `ENR-9` Black-format and verify CI passes
+
+### Enrich-2 — Wire enricher into all scrapers
+
+- [~] `ENR-10` Update scraper pipeline signature in all five scrapers to call
+  `enrich_book()` after `resolve_isbns()`, before `write_csv()`. Pipeline becomes:
+  ```
+  resolve_isbns() → enrich_books() → write_csv()
+  ```
+- [x] `ENR-11` `chirp_to_libib/core.py` — add enrichment step; map `EnrichmentResult`
+  fields into the 28-column row dict; populate `group` and prepend series notes
+- [x] `ENR-12` `kindle_to_libib/core.py` — same as ENR-11
+- [x] `ENR-13` `kobo_to_libib/core.py` — same as ENR-11
+- [ ] `ENR-14` `nook_to_libib/core.py` — include enrichment step in initial scaffold
+  (Nook-1 should build with enrichment wired in from the start)
+- [ ] `ENR-15` `google_to_libib/core.py` — include enrichment step in initial scaffold;
+  note that Google Books API already supplies description/publisher/publish_date/ISBNs,
+  so enrichment for Google Books books skips Open Library + Google Books metadata calls
+  and only runs the Wikidata series lookup
+- [~] `ENR-16` `--no-enrich` CLI flag on all five scrapers — skips enrichment step entirely
+  (useful for fast runs or offline use)
+- [x] `ENR-17` Update `tests/test_chirp.py`, `test_kindle.py`, `test_kobo.py` — mock
+  `enrich_book` in enrichment-path tests; ensure existing tests still pass with enrichment
+  wired in
+- [x] `ENR-18` README — add Enrichment section: data sources, fields populated, series
+  format, `--no-enrich` flag, note that price is not fetched
+- [x] `ENR-19` Full test suite passes; CI green
+
+### AI-1 — AI provider fallback for metadata
+
+**Scope:** Metadata fields only (`description`, `publisher`, `publish_date`, `length_of`,
+missing ISBNs). **Never used for series/`group` resolution** — series stays Wikidata-only.
+Opt-in: if no provider is configured via env var, this stage is skipped entirely and the
+fallback chain behaves exactly as it does today (Open Library → Google Books → blank).
+
+**Provider selection:** env var only, no CLI flag, no config file.
+- `AI_PROVIDER` — e.g. `openai` (unset = AI fallback disabled)
+- `OPENAI_API_KEY` — provider-specific key, same pattern as other credential env vars
+
+Designed as a provider abstraction so additional providers (Anthropic, etc.) can be
+added later without changing the enricher's call site.
+
+- [x] `AI-1` Define provider-agnostic interface: `_fetch_ai_metadata(provider, title, author, isbn) -> dict`
+  in `lib/enricher.py` (or a new `lib/ai_lookup.py` if it grows large)
+- [x] `AI-2` `_fetch_openai_metadata(title, author, isbn) -> dict` — call OpenAI's API,
+  prompt for structured JSON output (description, publisher, publish_date, page count only);
+  parse and validate the response; never fabricate an ISBN via AI (ISBN resolution is
+  Open Library's job, not the AI fallback's)
+- [x] `AI-3` Wire into `enrich_book()`'s metadata fallback chain, after Google Books
+  Metadata API and before "leave blank"; confirm series/`group` path is completely
+  untouched by this change
+- [x] `AI-4` Read `AI_PROVIDER` env var to select provider at runtime; if unset, skip the
+  AI stage entirely (no API calls, no errors, silent no-op)
+- [x] `AI-5` Read provider-specific API key from env var (`OPENAI_API_KEY` for `openai`);
+  clear from any debug output/logs, consistent with existing credential-clearing pattern
+- [x] `AI-6` Graceful failure handling — any API error, timeout, rate limit, or malformed
+  JSON response falls through to "leave blank" and logs a warning; never crashes the pipeline
+- [x] `AI-7` `tests/test_ai_lookup.py` (or add to `test_enricher.py`) — mocked OpenAI
+  responses: hit, miss, malformed JSON, API error, `AI_PROVIDER` unset (confirm no-op)
+- [x] `AI-8` README — new section: how to enable AI fallback, required env vars, explicit
+  note that it's metadata-only and disabled by default
+- [x] `AI-9` Update `docs/CLAUDE.md` fallback chain diagram and Key Decisions with this design
+- [x] `AI-10` Black-format, full test suite passes, CI green
+
+---
+
+## Nook Scraper (`nook_to_libib`) — COMPLETE (Nook-1 + Nook-2, 2026-07-21)
+
+### Confirmed DOM selectors (from DevTools, 2026-07-21, nook.barnesandnoble.com/my_library/ebook)
+
+- Container: `ul > li[data-test="{ISBN-13}"]` — one `<li>` per book, ISBN-13 on `data-test`
+- Tile: `div.equator-tile.book.new-product-tile > div.south > div.info-section`
+- Title link: `div.title > a` — has `data-product-id` (ISBN, redundant), `data-product-title`
+  (full untruncated title — use this, not the `<li>` display text, which is
+  ellipsis-truncated via `text-overflow:ellipsis;width:160px`), `href="/products/{isbn}/sample"`
+- Author link: sibling `<a href="http://www.barnesandnoble.com/search?q={Author}">` right
+  after the title div, inside the same `info-section` — link text is the author name
+- Cover image: `<img data-bntrack="LinkedImage" src="{cover-url}" alt="Cover Image: {title}" title="{title}">`
+  — read `src` directly, no `srcset` parsing needed (confirmed 2026-07-21, closing out the
+  gap the DOM capture above didn't originally cover)
+
+This unblocked Nook-1: ISBN, title, author, and cover are all available without fighting
+the truncated display text.
+
+**Pagination:** unconfirmed at scale — Jennifer's own library is small enough that no
+next-page control appears, so `scrape_nook()` scrapes a single page load. `--pages` is
+still accepted on the CLI for consistency but is currently a no-op. Revisit if a larger
+library is tested and pagination/infinite-scroll turns out to be needed.
+
+**Approach:** Selenium + manual login pause (same pattern as Chirp — not Kobo's two-tab
+trick, which exists specifically to defeat hCaptcha; B&N uses Akamai instead).
+Library URL used: `https://nook.barnesandnoble.com/my_library/ebook` (this is where the
+confirmed selectors above were captured from — note this differs from the
+`barnesandnoble.com/account/my-digital-library` URL mentioned in earlier planning notes).
+
+**ISBN comes from the DOM, not a lookup.** Because `data-test` on the container is the
+ISBN-13, `resolve_isbns()` in `nook_to_libib` only calls Open Library as a fallback for
+the rare book missing one — unlike Chirp/Kindle/Kobo, where every book needs a live
+lookup. See `docs/CLAUDE.md` for the full pipeline diagram.
 
 ### Nook-1 — Core scraper
 
-- [ ] `NOOK-1` Scaffold `nook_to_libib/` with `__init__.py`, `__main__.py`, `core.py`
-- [ ] `NOOK-2` Add `nook_to_libib` to `packages` in `pyproject.toml`
-- [ ] `NOOK-3` `_build_driver()` — same anti-fingerprint flags as Chirp/Kobo
-- [ ] `NOOK-4` `_login()` — manual pause flow; verify library grid visible before continuing
-- [ ] `NOOK-5` `_parse_items()` — extract `(title, author, cover_url)` from DOM (selectors TBD from screenshot)
-- [ ] `NOOK-6` `scrape_nook()` — full pagination loop with `--pages` limit support
-- [ ] `NOOK-7` `resolve_isbns()` — reuse `get_isbn` + `sleep_between_requests` from `lib`
-- [ ] `NOOK-8` `write_csv()` — 28-column Libib CSV, tag = `nook,ebook`, UTF-8-sig
-- [ ] `NOOK-9` `write_unresolved()` — txt report of books without ISBNs
-- [ ] `NOOK-10` `main()` + CLI: `--pages`, `--dry-run`, `--output-dir`
-- [ ] `NOOK-11` Black-format and verify CI passes
+- [x] `NOOK-1` Scaffold `nook_to_libib/` with `__init__.py`, `__main__.py`, `core.py`
+- [x] `NOOK-2` Add `nook_to_libib` to `packages` in `pyproject.toml`
+- [x] `NOOK-3` `_build_driver()` — same anti-fingerprint flags as Chirp/Kobo
+- [x] `NOOK-4` `_login()` — manual pause flow; verify library grid visible before continuing
+- [x] `NOOK-5` `_parse_items()` — extract `(title, author, isbn, cover_url)` from DOM;
+  ISBN read directly from `data-test` on the container (no separate lookup needed)
+- [x] `NOOK-6` `scrape_nook()` — single page load (pagination unconfirmed at scale, see above);
+  `--pages` accepted for CLI consistency but currently a no-op
+- [x] `NOOK-7` `resolve_isbns()` — trusts the scraped ISBN; only calls `get_isbn` +
+  `sleep_between_requests` from `lib` as a fallback when `data-test` is missing/empty
+- [x] `NOOK-8` `enrich_books()` — call `enrich_book` from `lib` per resolved book (see ENR-14);
+  wired in from the initial scaffold, not retrofitted
+- [x] `NOOK-9` `write_csv()` — 28-column Libib CSV, tag = `nook,ebook`, UTF-8-sig
+- [x] `NOOK-10` `write_unresolved()` — txt report of books without ISBNs
+- [x] `NOOK-11` `main()` + CLI: `--pages`, `--dry-run`, `--output-dir`, `--no-enrich`
+- [x] `NOOK-12` Black-format and verify CI passes
 
 ### Nook-2 — Tests, CI, docs
 
-- [ ] `NOOK-12` `tests/test_nook.py` — unit tests for `_parse_items`, dedup, filter, resolve_isbns, write_csv, write_unresolved
-- [ ] `NOOK-13` Add `nook_to_libib` to `[tool.coverage.run] source` in `pyproject.toml`
-- [ ] `NOOK-14` README — Nook section: manual login instructions, output files, CLI flags
-- [ ] `NOOK-15` Update `docs/CLAUDE.md` — add Nook to providers table and login strategies
-- [ ] `NOOK-16` Update `libib_reconcile` provider classifier to recognise `nook` tag
-- [ ] `NOOK-17` Update `OUT-6` out-of-scope report to remove Nook (it now has a scraper)
-- [ ] `NOOK-18` Full test suite passes; CI green
+- [x] `NOOK-13` `tests/test_nook.py` — 21 tests covering `_parse_items`, `_dedupe_and_filter`
+  (including the ISBN-keyed cover reattachment), `resolve_isbns` (trust + fallback paths),
+  `enrich_books` (mocked), `write_csv`, `write_unresolved`, CLI flags
+- [x] `NOOK-14` Add `nook_to_libib` to `[tool.coverage.run] source` in `pyproject.toml`
+- [x] `NOOK-15` README — Nook section: manual login instructions, output files, CLI flags,
+  `--pages` no-op caveat, ISBN-from-DOM note
+- [x] `NOOK-16` Update `docs/CLAUDE.md` — add Nook to providers table, login strategies,
+  and its own pipeline diagram (it diverges from Chirp/Kindle/Kobo)
+- [ ] `NOOK-17` Update `libib_reconcile` provider classifier to recognise `nook` tag —
+  **deferred**: `libib_reconcile` hasn't been scaffolded yet (Rec-1 is still `[ ]`).
+  The classifier's planned keyword list (`LIB-3`) already includes `nook`; nothing to
+  change until that module exists.
+- [x] `NOOK-18` Full test suite passes; CI green (123 tests, ruff/black/mypy clean)
 
 ---
 
@@ -113,7 +337,9 @@ Add to `requirements.txt` when scaffolding.
 - Base URL: `https://www.googleapis.com/books/v1/mylibrary/bookshelves/7/volumes`
 - Auth: OAuth 2.0, scope `https://www.googleapis.com/auth/books`
 - Rate limit: 1000 requests/day (free tier) — well above any personal library size
-- Returns: title, authors, ISBNs (industryIdentifiers), thumbnail — **no Open Library lookup needed for most books**
+- Returns: title, authors, ISBNs (industryIdentifiers), thumbnail, description,
+  publisher, publishedDate, pageCount — **enrichment skips metadata calls for Google
+  books that already have these fields; only Wikidata series lookup runs**
 - Pagination: `startIndex` + `maxResults` (max 40 per page)
 
 ### Google-1 — Core scraper
@@ -121,135 +347,578 @@ Add to `requirements.txt` when scaffolding.
 - [ ] `GOOG-1` Scaffold `google_to_libib/` with `__init__.py`, `__main__.py`, `core.py`
 - [ ] `GOOG-2` Add `google_to_libib` to `packages` in `pyproject.toml`
 - [ ] `GOOG-3` Add `google-api-python-client` and `google-auth-oauthlib` to `requirements.txt`
-- [ ] `GOOG-4` OAuth 2.0 flow: load credentials from `~/.config/libibtools/google_token.json`; run browser consent on first use; auto-refresh thereafter
-- [ ] `GOOG-5` `fetch_all_books()` — paginate through Purchased shelf; extract `(title, author, isbn, cover_url)` directly from API response
-- [ ] `GOOG-6` ISBN extraction from `industryIdentifiers` array — prefer ISBN-13, fall back to ISBN-10, then Open Library lookup if neither present
-- [ ] `GOOG-7` `write_csv()` — 28-column Libib CSV, tag = `google,ebook`, UTF-8-sig
-- [ ] `GOOG-8` `write_unresolved()` — txt report of books without ISBNs
-- [ ] `GOOG-9` `main()` + CLI: `--dry-run`, `--output-dir`, `--credentials PATH` (default: `~/.config/libibtools/google_credentials.json`)
-- [ ] `GOOG-10` Black-format and verify CI passes
+- [ ] `GOOG-4` OAuth 2.0 flow: load credentials from `~/.config/libibtools/google_token.json`;
+  run browser consent on first use; auto-refresh thereafter
+- [ ] `GOOG-5` `fetch_all_books()` — paginate through Purchased shelf; extract
+  `(title, author, isbn, cover_url, description, publisher, publish_date, page_count)`
+  directly from API response
+- [ ] `GOOG-6` ISBN extraction from `industryIdentifiers` array — prefer ISBN-13,
+  fall back to ISBN-10, then Open Library lookup if neither present
+- [ ] `GOOG-7` `enrich_books()` — call `enrich_book` from `lib` per book; pass
+  already-populated metadata fields through so enricher skips redundant lookups
+  (only Wikidata series query runs for books with full metadata)
+- [ ] `GOOG-8` `write_csv()` — 28-column Libib CSV, tag = `google,ebook`, UTF-8-sig
+- [ ] `GOOG-9` `write_unresolved()` — txt report of books without ISBNs
+- [ ] `GOOG-10` `main()` + CLI: `--dry-run`, `--output-dir`,
+  `--credentials PATH` (default: `~/.config/libibtools/google_credentials.json`),
+  `--no-enrich`
+- [ ] `GOOG-11` Black-format and verify CI passes
 
 ### Google-2 — Tests, CI, docs
 
-- [ ] `GOOG-11` `tests/test_google.py` — unit tests with mocked API responses: pagination, ISBN extraction, CSV output, unresolved output
-- [ ] `GOOG-12` Add `google_to_libib` to `[tool.coverage.run] source` in `pyproject.toml`
-- [ ] `GOOG-13` README — Google Books section: OAuth setup walkthrough (Google Cloud Console steps), credentials file location, CLI flags
-- [ ] `GOOG-14` README — note that `--pages` is not needed (API returns full library in one paginated batch)
-- [ ] `GOOG-15` Update `docs/CLAUDE.md` — add Google to providers table
-- [ ] `GOOG-16` Update `libib_reconcile` provider classifier to recognise `google` tag
-- [ ] `GOOG-17` Full test suite passes; CI green
+- [ ] `GOOG-12` `tests/test_google.py` — unit tests with mocked API responses:
+  pagination, ISBN extraction, enrichment (mocked), CSV output, unresolved output
+- [ ] `GOOG-13` Add `google_to_libib` to `[tool.coverage.run] source` in `pyproject.toml`
+- [ ] `GOOG-14` README — Google Books section: OAuth setup walkthrough (Google Cloud
+  Console steps), credentials file location, CLI flags
+- [ ] `GOOG-15` README — note that `--pages` is not needed (API returns full library
+  in one paginated batch)
+- [ ] `GOOG-16` Update `docs/CLAUDE.md` — add Google to providers table
+- [ ] `GOOG-17` Update `libib_reconcile` provider classifier to recognise `google` tag
+- [ ] `GOOG-18` Full test suite passes; CI green
 
 ---
 
 ## Reconciler (`libib_reconcile`)
 
-### Epic 1 — Libib CSV Parser
+### Epic 1 — Libib CSV Parser — COMPLETE (2026-07-21)
 **File:** `libib_reconcile/libib_reader.py`
 **Session:** Rec-1
 
-- [ ] `LIB-1` Parse Libib export CSV; handle UTF-8-sig encoding and quoted fields with embedded commas
-- [ ] `LIB-2` Tag normalizer: lowercase → split on `,` → strip whitespace → return `set[str]`
-- [ ] `LIB-3` Provider classifier: scan normalized tag set; return `set[str]` of detected providers (`kindle`, `kobo`, `chirp`, `nook`, `google`, `digital_unknown`)
-- [ ] `LIB-4` Entry filter: skip any entry whose tag set contains `deleted` or `removed`
-- [ ] `LIB-5` Entry filter: skip entries with no digital provider keywords at all (physical-only books)
-- [ ] `LIB-6` Flag `digital`-only entries (tag set contains `digital` but no named provider) as ambiguous
-- [ ] `LIB-7` Extract existing ISBNs from `ean_isbn13` and `upc_isbn10` fields for use as primary match keys
+- [x] `LIB-1` Parse Libib export CSV; handle UTF-8-sig encoding and quoted fields with embedded commas
+- [x] `LIB-2` Tag normalizer: lowercase → split on `,` → strip whitespace → return `set[str]`
+- [x] `LIB-3` Provider classifier: scan normalized tag set; return `set[str]` of detected providers (`kindle`, `kobo`, `chirp`, `nook`, `google`, `digital_unknown`)
+- [x] `LIB-4` Entry filter: skip any entry whose tag set contains `deleted` or `removed`
+- [x] `LIB-5` Entry filter: skip entries with no digital provider keywords at all (physical-only books)
+- [x] `LIB-6` Flag `digital`-only entries (tag set contains `digital` but no named provider) as ambiguous
+- [x] `LIB-7` Extract existing ISBNs from `ean_isbn13` and `upc_isbn10` fields for use as primary match keys
 
-### Scaffolding tasks (also Rec-1)
-- [ ] `SCAFFOLD-1` Create `libib_reconcile/` with `__init__.py`, `__main__.py`, `core.py`, `libib_reader.py`, `reconciler.py`, `isbn_enricher.py`, `output.py`
-- [ ] `SCAFFOLD-2` Add `libib_reconcile` to `packages` in `pyproject.toml`
-- [ ] `SCAFFOLD-3` Create `tests/test_libib_reader.py` — tag normalizer, provider classifier, all filters
-- [ ] `SCAFFOLD-4` Verify full test suite still passes after scaffolding
+### Scaffolding tasks (also Rec-1) — COMPLETE
+- [x] `SCAFFOLD-1` Create `libib_reconcile/` with `__init__.py`, `__main__.py`, `core.py`, `libib_reader.py`, `reconciler.py`, `isbn_enricher.py`, `output.py`
+- [x] `SCAFFOLD-2` Add `libib_reconcile` to `packages` in `pyproject.toml`
+- [x] `SCAFFOLD-3` Create `tests/test_libib_reader.py` — tag normalizer, provider classifier, all filters
+- [x] `SCAFFOLD-4` Verify full test suite still passes after scaffolding
 
-### Epic 2 — Reconciliation Engine
+### Epic 2 — Reconciliation Engine — COMPLETE (2026-07-22)
 **File:** `libib_reconcile/reconciler.py`
 **Session:** Rec-2
 
-- [ ] `REC-1` ISBN-exact match: if both sides have an ISBN, match on that first; highest confidence
-- [ ] `REC-2` Title+author fuzzy fallback using `_title_is_plausible()` from `lib/openlibrary.py`
-- [ ] `REC-3` Confidence scoring: `exact_isbn` = high, `fuzzy_title_author` = medium, `title_only` = low
-- [ ] `REC-4` Provider-aware matching: `kindle, kobo` entry checks both scrapes; match on either = matched
-- [ ] `REC-5` Cross-format: `chirp, kindle` entry matches either Chirp or Kindle scrape
-- [ ] `REC-6` Classify each scraped book: `matched` or `missing_from_libib`
-- [ ] `REC-7` Classify each Libib entry: `matched`, `libib_only` (orphan), `ambiguous`, or `out_of_scope`
-- [ ] `REC-8` Dedup scraped books before comparing (reuse `dedupe_books_by_title` from `lib`)
-- [ ] `REC-9` Unit tests in `tests/test_reconcile.py`
+Two-pass, two-pool consumption model: ISBN-exact is provider-agnostic and runs
+first (also the only way an `ambiguous` "digital"-only entry can resolve);
+fuzzy title/author is provider-scoped to the entry's own tags and runs second,
+greedy-assigned by descending title-similarity score (not an optimal bipartite
+solver — not worth the complexity at personal-library scale).
+
+- [x] `REC-1` ISBN-exact match: if both sides have an ISBN, match on that first; highest confidence
+- [x] `REC-2` Title+author fuzzy fallback using `_title_is_plausible()` from `lib/openlibrary.py`
+- [x] `REC-3` Confidence scoring: `exact_isbn` = high, `fuzzy_title_author` = medium, `title_only` = low
+- [x] `REC-4` Provider-aware matching: `kindle, kobo` entry checks both scrapes; match on either = matched
+- [x] `REC-5` Cross-format: `chirp, kindle` entry matches either Chirp or Kindle scrape
+- [x] `REC-6` Classify each scraped book: `matched` or `missing_from_libib`
+- [x] `REC-7` Classify each Libib entry: `matched`, `libib_only` (orphan), `ambiguous`, or `out_of_scope`
+- [x] `REC-8` Dedup scraped books before comparing (reuse `dedupe_books_by_title` from `lib`) —
+  found and fixed a real bug during this session: reattaching cover URLs via an
+  ISBN-keyed dict silently collided/dropped covers whenever multiple scraped
+  books shared an empty/unresolved ISBN. Fixed by packing isbn+cover into the
+  dedupe helper's opaque 3rd field instead of a lossy dict lookup.
+- [x] `REC-9` Unit tests in `tests/test_reconcile.py` — 22 tests
 
 ### Epic 3 — ISBN Enrichment
 **File:** `libib_reconcile/isbn_enricher.py`
-**Session:** Rec-3
+**Session:** Rec-3 — COMPLETE (2026-07-22)
 
-- [ ] `ISBN-1` For each `missing_from_libib` book, call `get_isbn(title, author)` from `lib`
-- [ ] `ISBN-2` Skip Open Library lookup if book already has an ISBN (Google API provides these directly)
-- [ ] `ISBN-3` Respect rate limiting via `sleep_between_requests()` from `lib`
-- [ ] `ISBN-4` Log progress at `ISBN_LOG_INTERVAL = 25`
-- [ ] `ISBN-5` Track and report enrichment rate
-- [ ] `ISBN-6` Unit tests: mock `get_isbn` and verify enrichment
+- [x] `ISBN-1` For each `missing_from_libib` book, call `get_isbn(title, author)` from `lib`
+- [x] `ISBN-2` Skip Open Library lookup if book already has an ISBN (Google API provides these directly)
+- [x] `ISBN-3` Respect rate limiting via `sleep_between_requests()` from `lib`
+- [x] `ISBN-4` Log progress at `ISBN_LOG_INTERVAL = 25`
+- [x] `ISBN-5` Track and report enrichment rate — via log lines (`"ISBN enrichment
+  complete: %d/%d gap book(s) resolved."`), matching the pattern every scraper's
+  own `resolve_isbns()` already uses, rather than a separately-returned stats object
+- [x] `ISBN-6` Unit tests: mock `get_isbn` and verify enrichment — 6 tests in
+  `tests/test_isbn_enricher.py`
 
-### Epic 4 — Output Files
+### Epic 4 — Output Files — COMPLETE (2026-07-22)
 **File:** `libib_reconcile/output.py`
 **Session:** Rec-3
 
-- [ ] `OUT-1` **Gap CSV**: missing books ready to import into Libib; full 28-column format; correct `tags` per provider; ISBN-populated where available
-- [ ] `OUT-2` **Reconciliation report** (`.txt`): summary counts + per-provider breakdown
-- [ ] `OUT-3` **Orphan report** (`.txt`): Libib entries not found in any scrape
-- [ ] `OUT-4` **Low-confidence match report** (`.txt`): fuzzy matches needing human review
-- [ ] `OUT-5` **Ambiguous report** (`.txt`): `digital`-only entries with no named provider
-- [ ] `OUT-6` Timestamp all output files: `reconcile_YYYY-MM-DD_HH-MM_<type>.{csv,txt}`
-- [ ] `OUT-7` Unit tests: CSV columns, tag assignment, dry-run writes nothing
+- [x] `OUT-1` **Gap CSV**: missing books ready to import into Libib; full 28-column format;
+  correct `tags` per provider; ISBN-populated where available; enrichment applied
+  (description, publisher, publish_date, length_of, group, notes) via `enrich_book`
+- [x] `OUT-2` **Reconciliation report** (`.txt`): summary counts + per-provider breakdown
+- [x] `OUT-3` **Orphan report** (`.txt`): Libib entries not found in any scrape
+- [x] `OUT-4` **Low-confidence match report** (`.txt`): fuzzy matches needing human review —
+  covers both `medium` and `low` confidence, since any fuzzy match is worth a human glance
+- [x] `OUT-5` **Ambiguous report** (`.txt`): `digital`-only entries with no named provider
+- [x] `OUT-6` Timestamp all output files: `reconcile_YYYY-MM-DD_HH-MM_<type>.{csv,txt}` —
+  every writer takes an already-computed `timestamp` string rather than generating its
+  own, so one reconcile run's files share a single timestamp and each writer stays
+  independently testable without freezing the clock
+- [x] `OUT-7` Unit tests: CSV columns, tag assignment — 16 tests in
+  `tests/test_reconcile_output.py`. "Dry-run writes nothing" is a CLI-level behavior
+  (core.py simply not calling these writers), verified as part of Rec-4, not here.
 
-### Epic 5 — CLI & Orchestration
+### Epic 4a — Core Refactor: extract `run()` from `main()` — COMPLETE (2026-07-22)
+**Files:** `chirp_to_libib/core.py`, `kindle_to_libib/core.py`, `kobo_to_libib/core.py`, `nook_to_libib/core.py`
+**Session:** Rec-4a
+
+Enables `libib_reconcile --scrape` to call scrapers in-process instead of
+shelling out to `python -m chirp_to_libib` etc., and lets a future GUI reuse
+the same entry points without inventing this abstraction twice.
+
+- [x] `REFACTOR-1` Extract the body of `main()` in each scraper into
+  `run(*, pages, dry_run, output_dir, no_enrich, wait_fn=_default_wait) -> RunResult` —
+  explicit keyword args instead of an `argparse.Namespace`, returns a small
+  result object (paths written, counts) instead of only printing
+- [x] `REFACTOR-2` `main()` becomes a thin wrapper: `parse_args()` → `run(...)` with
+  parsed values → print final message. Existing CLI behavior unchanged (verified:
+  same log lines, same final "Upload '...' to Libib" message).
+- [x] `REFACTOR-3` Add `wait_fn: Callable[[], None] = _default_wait` param to
+  `_login()` in Chirp/Kobo/Nook. `_default_wait` bundles the exact print+input
+  each scraper already had (its own instructional text preserved verbatim) —
+  `_login()` itself no longer prints anything, it just calls `wait_fn()`.
+  Default preserves current CLI behavior exactly — purely additive change.
+- [x] `REFACTOR-4` Kindle gets the same `run()` extraction for CLI/GUI symmetry
+  (no `wait_fn` — automated login, unchanged). `run()` deliberately takes no
+  email/password params — credentials stay env-var/prompt-only via the existing
+  `_prompt_credentials()`, consistent with the GUI's "never accept credentials
+  through a browser form" design decision.
+- [x] `REFACTOR-5` Verify every existing test still passes — of the 203 tests
+  that predated this refactor, only one needed a change. The exception:
+  `test_pipeline.py`'s
+  `mock_scrape.assert_called_once_with(...)` needed updating to expect the new
+  `wait_fn=` kwarg now threaded through `scrape_chirp()` — a correct, intentional
+  consequence of the new parameter, not a behavior regression, so this still
+  counts as "no behavior change," just one assertion learning about a real new arg.
+- [x] `REFACTOR-6` New unit tests for `run()` directly (`scrape_x` mocked) — added
+  across `test_pipeline.py` (Chirp), `test_kindle.py`, `test_kobo.py`, `test_nook.py`:
+  paths/counts on success, empty result when nothing scraped, dry-run returns no
+  paths, `wait_fn` threads through to `scrape_*()`. Left `core.py:main` in the
+  coverage omit list — it's now a few lines of trivial glue, appropriately excluded;
+  `run()` itself is *not* omitted and is the thing the new tests actually cover.
+- [x] `REFACTOR-7` Black-format, ruff, mypy, full suite green — 216 tests, coverage
+  79% (gate is 65%)
+
+### Epic 5 — CLI & Orchestration — COMPLETE (2026-07-22)
 **Files:** `libib_reconcile/__main__.py`, `libib_reconcile/core.py`
 **Session:** Rec-4
 
-- [ ] `CLI-1` `--libib PATH` — Libib export CSV (required)
-- [ ] `CLI-2` `--scrape` — trigger live scrapes of all five providers
-- [ ] `CLI-3` `--kindle PATH` / `--kobo PATH` / `--chirp PATH` / `--nook PATH` / `--google PATH` — accept pre-existing scrape CSVs
-- [ ] `CLI-4` `--output-dir PATH` — consistent with other tools
-- [ ] `CLI-5` `--providers kindle kobo chirp nook google` — limit to specific providers
-- [ ] `CLI-6` `--dry-run` — no output files written
-- [ ] `CLI-7` Validate at least one provider source supplied; exit with clear error if not
-- [ ] `CLI-8` `__main__.py`: `from .core import main` + `if __name__ == "__main__": main()`
+- [x] `CLI-1` `--libib PATH` — Libib export CSV (required)
+- [x] `CLI-2` `--scrape` — trigger live scrapes by calling each scraper's `run()`
+  entry point in-process (via `importlib`, lazily — see design note below), not
+  by shelling out. Always called with `no_enrich=True`: enriching every scraped
+  book up front is wasteful when only the gap subset ultimately needs it —
+  `enrich_gap_books()` (Rec-3) enriches once reconciliation has narrowed the set.
+- [x] `CLI-3` `--kindle PATH` / `--kobo PATH` / `--chirp PATH` / `--nook PATH` /
+  `--google PATH` — accept pre-existing scrape CSVs. Both this and `--scrape`
+  output converge on `_load_scrape_csv()`, which reads any `LIBIB_HEADERS`-shaped
+  CSV back into `(title, author, isbn, cover)` tuples — one interchange format
+  either way. `--google` is accepted even though `google_to_libib` isn't built
+  yet (someone could supply a manually-prepared CSV); `--scrape` with `google`
+  in `--providers` just logs a warning and skips it.
+- [x] `CLI-4` `--output-dir PATH` — consistent with other tools
+- [x] `CLI-5` `--providers kindle kobo chirp nook google` — limit to specific providers
+- [x] `CLI-6` `--dry-run` — suppresses only `run()`'s own output files (summary,
+  gap CSV, orphan/low-confidence/ambiguous). If `--scrape` is used, each
+  provider scrape still runs for real and writes its own intermediate CSV —
+  that's the data source reconciliation needs, not a side effect `--dry-run`
+  can skip under the current scraper `run()` contract. Documented explicitly
+  in `run()`'s docstring so this isn't a surprise later.
+- [x] `CLI-7` `--no-enrich` — skip enrichment on gap CSV (fast mode)
+- [x] `CLI-8` Validate at least one provider source supplied; exit with clear
+  error if not (`ValueError` in `run()`, caught and turned into `SystemExit` in `main()`)
+- [x] `CLI-9` `__main__.py`: `from .core import main` + `if __name__ == "__main__": main()`
 
-### Epic 6 — Tests & CI
+Follows the same `run()`/`main()` split as the four scrapers (Rec-4a):
+`run(*, libib_path, output_dir, providers, scrape, chirp, kindle, kobo, nook,
+google, dry_run, no_enrich) -> ReconcileRunResult`, callable directly without
+argparse. Verified end-to-end with a real (non-mocked) CLI invocation —
+`python -m libib_reconcile --libib ... --kindle ... --no-enrich` — producing
+correct gap CSV + summary counts against the Rec-1 fixture.
+
+### Epic 6 — Tests & CI — COMPLETE (2026-07-22)
 **Session:** Rec-4
 
-- [ ] `TST-1` Tag normalization edge cases: empty, whitespace, `deleted`/`removed`, mixed case
-- [ ] `TST-2` Provider classification: all five providers; `digital`-only; physical-only
-- [ ] `TST-3` ISBN-exact matching
-- [ ] `TST-4` Fuzzy matching: subtitle variants, threshold behaviour
-- [ ] `TST-5` Provider-aware matching: `kindle, kobo` matches either scrape
-- [ ] `TST-6` Cross-format: `chirp, kindle` matches either
-- [ ] `TST-7` Gap CSV: correct columns, correct tags, ISBN populated when available
-- [ ] `TST-8` Dry-run: no files on disk
-- [ ] `TST-9` Integration test: fixture CSVs with known gap → assert correct counts
-- [ ] `TST-10` Add `libib_reconcile` to `[tool.coverage.run] source` in `pyproject.toml`
-- [ ] `TST-11` Full suite passes; CI green
+- [x] `TST-1` Tag normalization edge cases — `tests/test_libib_reader.py` (Rec-1)
+- [x] `TST-2` Provider classification — `tests/test_libib_reader.py` (Rec-1)
+- [x] `TST-3` ISBN-exact matching — `tests/test_reconcile.py` (Rec-2)
+- [x] `TST-4` Fuzzy matching — `tests/test_reconcile.py` (Rec-2)
+- [x] `TST-5` Provider-aware matching — `tests/test_reconcile.py` (Rec-2)
+- [x] `TST-6` Cross-format matching — `tests/test_reconcile.py` (Rec-2)
+- [x] `TST-7` Gap CSV columns/tags/enrichment — `tests/test_reconcile_output.py` (Rec-3)
+- [x] `TST-8` Dry-run: no files on disk — `tests/test_reconcile_core.py`,
+  `test_run_dry_run_no_files_on_disk` (asserts `os.listdir(tmp) == []`)
+- [x] `TST-9` Integration test: fixture CSVs with known gap → assert correct counts —
+  `tests/test_reconcile_core.py::test_run_integration_known_gap`, using
+  `tests/fixtures/libib_export_sample.csv` + new `tests/fixtures/scrape_kindle_sample.csv`
+  (one book that matches an existing Libib entry by ISBN, one genuinely new book) —
+  runs the real, non-mocked pipeline end-to-end and asserts the gap CSV contains
+  exactly the new book and the summary reports the correct counts
+- [x] `TST-10` Added `libib_reconcile` to `[tool.coverage.run] source` in
+  `pyproject.toml`, plus `omit` entries for `__main__.py` and `core.py:main`
+  (trivial glue, same as every scraper)
+- [x] `TST-11` Full suite passes; CI green — 232 tests, coverage 87% for the
+  three `source`-tracked packages combined (gate is 65%)
 
 ### Rec-5 — Integration & Polish
-*Not broken into tickets yet — depends on real data results.*
+*Partially validated 2026-07-22 (parser only — see below); the rest needs live
+scrapes, which need a human present for manual login. Not broken into full
+tickets yet — depends on those real scrape results.*
 
-- Run against real Libib export + all five provider scrapes
-- Review reconciliation report and orphan report for accuracy
-- Tune `_title_is_plausible()` threshold
-- Review low-confidence matches
-- Import gap CSV into Libib and verify it loads cleanly
-- Update `docs/CLAUDE.md` session history
-- Update `README.md` to document `libib_reconcile`
+**Parser validated against the real export** (`libib_library_export_20260609_225934.csv`):
+`read_libib_export()` parses all 3461 real rows in ~0.13s, zero errors, zero
+active entries left with an unclassified empty provider set. (Note: the file
+is 7026 *lines* but 3461 CSV *rows* — multi-paragraph description fields
+contain embedded newlines inside quoted fields, which `wc -l` counts but the
+`csv` module correctly doesn't; don't be alarmed by the line-count mismatch.)
+Real provider breakdown: kindle 1935, chirp 514, nook 147, kobo 54, google 11,
+digital_unknown (ambiguous) 6. A few tag tokens (`audible`, `bn`, `humblebundle`,
+`mp3`) aren't recognized as providers, but that's correct, not a bug — Audible
+has no scraper in this project (not Chirp), so those entries correctly fall to
+`digital_unknown`; `bn` is redundant with an accompanying `nook` tag.
+
+- [ ] Run against real scrapes from all providers (needs live browser + manual
+  login — human required)
+- [ ] Review reconciliation report and orphan report for accuracy against real matches
+- [ ] Tune `_title_is_plausible()` threshold using real fuzzy-match results
+- [ ] Review low-confidence matches
+- [ ] Import gap CSV into Libib and verify it loads cleanly
+- [ ] Update `README.md` to document `libib_reconcile` (CLI usage, flags, output files)
+
+---
+
+## Web GUI (`webapp`)
+
+### Architecture summary
+
+- New top-level package `webapp/` — FastAPI + Jinja2 + one shared `static/style.css`
+  design system + minimal hand-written vanilla JS. No SPA framework, no htmx, no
+  frontend build step — this is a local, single-user tool, not a product, and a
+  build pipeline would be complexity without payoff.
+- Selenium scrapes are synchronous end-to-end (no `await`-able API), so each scrape
+  job runs in a real OS thread (`threading.Thread`), never as an `asyncio` task —
+  running blocking Selenium code inside `async def` would freeze the whole server,
+  including the log stream telling the browser what's happening.
+- An in-memory job registry (`dict[str, Job]` behind a `threading.Lock`) tracks
+  status. No SQLite/Celery/Redis — this is deliberately right-sized for a
+  single-user, single-process, local tool; losing in-flight job history on a
+  server restart is an acceptable, explicit tradeoff, not an oversight.
+- Log streaming via Server-Sent Events (`StreamingResponse`, `text/event-stream`)
+  off a per-job `queue.Queue`. One global `logging.Handler`, attached once at
+  startup, maps `threading.get_ident()` → job and pushes matching log records
+  onto that job's queue — no changes needed to any scraper's existing
+  `log.info(...)` call sites. SSE over WebSocket because the browser only needs
+  one-directional push; Continue/Cancel are independent, infrequent, and map
+  cleanly onto ordinary `POST` requests — no bidirectional need, no new dependency
+  (native `EventSource`, no client library).
+- Manual login (Chirp/Kobo/Nook): `_login()` gets a `wait_fn` parameter (see
+  `REFACTOR-3` above). The web layer's `wait_fn` flips the job to
+  `waiting_for_login` and polls a `threading.Event` that the browser's "Continue"
+  button sets via `POST .../continue` — replacing today's terminal `input()`.
+  Default `wait_fn` is unchanged `print(...); input()`, so the CLI is untouched.
+- Cancellation: Tier 1 (must-have) — cancel while blocked on the login wait, via
+  the same polling loop checking a `cancel_event`, unwinding cleanly through each
+  scraper's existing `try/finally: driver.quit()`. Tier 2 (nice-to-have) — a
+  "Force Stop" during active scraping that calls `driver.quit()` directly from
+  the registry, honestly labeled as an interrupt rather than a graceful stop.
+  A FastAPI shutdown hook force-quits any still-live drivers so a server restart
+  doesn't orphan Chrome processes.
+- One active job per provider at a time, enforced by the registry — beyond UI
+  clarity, running two concurrent sessions against a CAPTCHA-sensitive site
+  (Kobo/Chirp/Nook) from the same browser profile risks getting flagged.
+
+### Security
+
+- Bind `127.0.0.1` only, hardcoded — never `0.0.0.0`. This tool spawns a real
+  browser tied to the desktop session and handles credentials in-process; there's
+  no reason for it to listen beyond localhost.
+- Uploaded Libib CSVs: enforce a max body size before fully buffering, validate
+  CSV *shape* (attempt a parse) rather than trusting the extension or
+  `Content-Type` alone (both are client-supplied and spoofable), and never use
+  the client-supplied filename to construct a filesystem path — generate a
+  server-side name (`uuid4().hex + ".csv"`), stage it under a fixed uploads
+  directory, and validate any output path with `Path.resolve()` +
+  `is_relative_to(base_dir)` before ever writing to or reading from it.
+- CSRF: a same-origin policy blocks an attacker page from *reading* a response
+  from `127.0.0.1`, but not from *sending* a state-changing request (e.g. an
+  auto-submitting hidden form) — a real, documented class of attack against
+  localhost dev servers. Mitigate with an Origin/Referer check dependency on
+  every `POST`/`DELETE` route, rejecting anything not `http://127.0.0.1:<port>`
+  or `http://localhost:<port>`. No session/cookie machinery needed for this.
+- Credentials stay env-var/`.env`-only, **never accepted via a browser form** —
+  a browser-submitted credential sits in server memory with more accidental leak
+  surface (request logging, a future "save settings" feature) for no real
+  convenience gain, since the user still types it once either way. The Settings
+  page is read-only status (`configured` / `not configured`), never a value.
+  Google's future OAuth consent screen is fine to route through the browser
+  since the consent page itself is Google's, not ours — the resulting token file
+  still never touches rendered HTML.
+
+### GUI-Backend-1 — webapp skeleton — COMPLETE (2026-07-22)
+- [x] `WEB-1` App factory (`webapp/main.py`, `webapp/app.py`, `webapp/__main__.py`
+  for `python -m webapp`); `127.0.0.1` binding only. Verified with a real
+  `uvicorn` process (not just `TestClient`) — dashboard and static CSS both
+  return 200.
+- [x] `WEB-2` `base.html` Jinja2 template; `static/style.css` stub (design
+  tokens only — CSS custom properties incl. a `prefers-color-scheme: dark`
+  block; component classes land in GUI-Frontend-1)
+- [x] `WEB-3` Dashboard route (`GET /`) — per-tool cards (`ToolCard` dataclass)
+  for Chirp/Kindle/Kobo/Nook incl. a disabled Google Books placeholder with
+  "Coming soon" + a 1-line explanation of the planned OAuth approach
+- [x] `WEB-4` `tests/test_webapp_dashboard.py` — 6 tests: dashboard 200, all
+  four live tools render, Google placeholder + "Coming soon" render, enabled
+  tools have `/scrape/<slug>` links, Google has none, static CSS served
+- [x] `WEB-5` Added `webapp` to `pyproject.toml` `packages` + coverage `source`
+  (with `webapp/__main__.py`/`webapp/main.py` omitted, same convention as the
+  scrapers). New runtime deps added to `requirements.txt`: `fastapi`,
+  `uvicorn[standard]`, `jinja2`, `python-multipart`, `python-dotenv`; `httpx`
+  added to `requirements-dev.txt` for `TestClient`.
+
+### GUI-Backend-2 — job registry + runner — COMPLETE (2026-07-22)
+- [x] `WEB-6` `Job` dataclass (id, provider, status, created_at, log_queue,
+  continue_event, cancel_event, thread, error) — field renamed `result_paths`
+  → `result: Any` in the actual implementation: it holds the whole `RunResult`/
+  `ReconcileRunResult` object a provider's `run()` returns (which already
+  carries the path fields), not a separately-extracted dict. Simpler, and the
+  download endpoints (GUI-Backend-5) can pull specific paths off it directly.
+- [x] `WEB-7` `JobRegistry` (`webapp/jobs/registry.py`) — `dict[str, Job]`
+  behind `threading.Lock`; one-active-job-per-provider guard via
+  `JobAlreadyRunningError`
+- [x] `WEB-8` `runner.py` — `start_job()` spawns a daemon thread; status
+  transitions `queued → running → (waiting_for_login →running)? →
+  completed/failed/cancelled`. `run_callable: Callable[[wait_fn], Any]` is how
+  the runner stays provider-agnostic — it builds `wait_fn` and hands it to the
+  caller-supplied callable, rather than needing to know each scraper's `run()`
+  signature (Kindle has no `wait_fn` param at all; the caller just ignores the
+  argument for that one).
+- [x] `WEB-9` `tests/test_job_runner.py` — 8 tests: full lifecycle with and
+  without a login step, exception → `failed`, cancel-during-login-wait →
+  `cancelled`, one-active-job-per-provider enforcement, concurrent jobs for
+  different providers, registry lookup. All against a fake provider callable —
+  zero Selenium, zero real threads.io wait beyond real `threading.Thread`.
+
+### GUI-Backend-3 — log bridge + SSE — COMPLETE (2026-07-22)
+- [x] `WEB-10` `log_bridge.py` — `JobLogHandler`, thread-id → job map
+  (`register_thread`/`unregister_thread`, called from `runner.py`'s `_run()`),
+  `emit()` pushes to `job.log_queue`. Installed once on the root logger via
+  `install()`, called at `webapp/app.py` module load — every scraper's
+  existing `log.info(...)` calls reach the right job's queue with zero changes
+  to any scraper module.
+- [x] `WEB-11` `GET /scrape/{provider}/jobs/{job_id}/events` — SSE
+  `StreamingResponse`; 404s on unknown job or provider/job mismatch. Drains
+  buffered log lines first, only emits `event: done` once the job has reached
+  a terminal status *and* the queue is empty, so nothing buffered is ever lost.
+- [x] `WEB-12` `tests/test_log_bridge.py` — 5 tests incl. thread isolation
+  (job A's logs never leak into job B's queue). Caught a real cross-test
+  interaction while writing these: `webapp.app`'s module-level `install()`
+  call attaches a `JobLogHandler` to the *root* logger, and `_thread_jobs` is
+  shared module state — a test logger with default propagation enabled gets
+  double-delivered into the same job's queue (once via its own handler, once
+  via the globally-installed one). Fixed in the tests (`log.propagate =
+  False`), not in `log_bridge.py` — the global-handler design is correct for
+  the real app; test loggers just need the usual isolation discipline.
+- [x] `WEB-13` `tests/test_webapp_events.py` — 4 `TestClient` streaming tests:
+  buffered-lines-then-done, waits for terminal status before closing (job
+  finishes mid-stream from another thread), 404s for unknown job / provider
+  mismatch.
+
+### GUI-Backend-4 — manual login wait / continue / cancel — COMPLETE (2026-07-22, Tier 1 only — see below)
+- [x] `WEB-14` Web-layer `wait_fn` — done as part of `runner.py`'s
+  `_make_wait_fn()` (GUI-Backend-2/3), which flips the job to
+  `waiting_for_login` and polls `continue_event` (default CLI behavior
+  unchanged — see `REFACTOR-3`)
+- [x] `WEB-15` `POST /scrape/{provider}/jobs/{id}/continue` — sets
+  `continue_event`; `409` if the job isn't currently `waiting_for_login`,
+  `404` for an unknown job or provider mismatch
+- [x] `WEB-16` `POST /scrape/{provider}/jobs/{id}/cancel` — **Tier-1 only**,
+  shipped as originally scoped ("ship only the first as MVP" in the
+  Architecture summary below). Sets `cancel_event`, which the login-wait poll
+  loop observes and unwinds cleanly from. **Tier-2 "Force Stop" (`driver.quit()`
+  mid-scrape) is not implemented** — it needs a live Selenium driver reference
+  plumbed from inside each scraper's `scrape_*()` out to the `Job`, which
+  doesn't exist today and would mean touching all four scraper modules again.
+  Deliberately deferred rather than done as an unplanned mid-session scraper
+  refactor; tracked below as a follow-up ticket.
+- [x] `WEB-17` FastAPI shutdown hook (via a `lifespan` context manager, not
+  the deprecated `@app.on_event`) — cancels any non-terminal job on shutdown.
+  Same Tier-1 scope as `WEB-16`: reliably interrupts a job parked at a login
+  screen; has no effect on a job actively mid-scrape, for the same reason.
+- [x] `WEB-18` `tests/test_webapp_job_control.py` — 9 tests: continue
+  unblocks a waiting job, continue on a non-waiting job → 409, cancel during
+  login-wait → `cancelled`, cancel on an already-finished job → 409, 404s for
+  unknown job/provider mismatch on both endpoints, and a real
+  `TestClient`-context-exit test proving the shutdown hook cancels a job still
+  waiting on login.
+
+**Follow-up (not this session):** `GUI-BACKEND-4a` — Tier-2 force-stop.
+Requires each scraper's `scrape_*()` to publish its live driver (e.g. via a
+`driver_holder` callback passed into `run()`) so the registry can call
+`.quit()` on it directly from a cancel request or the shutdown hook, unwinding
+through the scraper's existing `try/finally: driver.quit()`. Small, well-scoped,
+but a real touch to all four scraper modules — deferred rather than folded in
+unplanned.
+
+### GUI-Backend-5 — scraper dispatch + downloads — COMPLETE (2026-07-22)
+- [x] `WEB-19` `POST /scrape/{provider}/jobs` — `ScrapeOptions` Pydantic body
+  (`pages`/`dry_run`/`output_dir`/`no_enrich`); `404` for an unknown/not-yet-built
+  provider, `409` via `JobAlreadyRunningError` if that provider already has a
+  live job. `_build_run_callable()` uses `inspect.signature()` to detect
+  whether the target scraper's `run()` accepts `wait_fn` (Kindle's doesn't) —
+  generic across all four scrapers without hardcoding per-provider branches.
+- [x] `WEB-20` `GET /downloads/{job_id}/{filename}` — never joins `filename`
+  onto a directory. Only ever serves a path that's already one of the job's
+  *own* known result paths (pulled generically off the `RunResult`/
+  `ReconcileRunResult` dataclass via `_extract_result_paths()`, matched by
+  basename) — `filename` never touches the filesystem directly.
+- [x] `WEB-21` `tests/test_webapp_scrape_dispatch.py` — 13 tests: dispatch
+  with/without `wait_fn` (verified via a fake provider module, since
+  `import_module` is mocked to return it regardless of the real module name
+  string passed in), 409 on concurrent same-provider jobs, 404s for unknown
+  job/filename, a URL-encoded path-traversal attempt (`..%2F..%2F..%2Fetc%2Fpasswd`)
+  rejected, and a real file genuinely served end-to-end. Verified again with a
+  real `uvicorn` process (not just `TestClient`) hitting all four route
+  families.
+
+**Testing gotcha worth remembering:** `@patch("webapp.app._SCRAPER_MODULES",
+...)` combined with `@patch("webapp.app.importlib.import_module")` in the same
+test silently breaks the first patch (confirmed via an isolated repro — some
+interaction in how `mock.patch` resolves nested targets under the same module
+path). Worked around by not patching `_SCRAPER_MODULES` at all: since
+`import_module` itself is mocked, it returns the fake module regardless of
+which real module name string gets looked up, so the real provider slugs
+(`chirp`, `kindle`, ...) can be used directly.
+
+### GUI-Frontend-1 — design system — COMPLETE (2026-07-22)
+- [x] `WEB-22` `static/style.css` — full token set (color/spacing/radius/font,
+  plus semantic success/warning/danger/info colors for status badges),
+  `prefers-color-scheme: dark` + `data-theme` override support, and
+  `.card`/`.btn` (`-secondary`/`-danger` variants)/`.badge`
+  (`.badge-status-{status}` mapping straight to job status strings, so
+  templates never need a Jinja if/elif chain)/`.log-panel`/form field classes.
+  Applied to `dashboard.html` now too (`.grid`/`.card`/`.btn`), rather than
+  leaving it unstyled until GUI-Frontend-2.
+- [x] `WEB-23` `base.html` — `.site-header`/`.site-footer` layout using the
+  shared CSS; footer states plainly what the app does and doesn't talk to
+  over the network.
+
+### GUI-Frontend-2 — dashboard page — COMPLETE except Reconcile card (2026-07-22)
+- [x] `WEB-24` Real per-tool cards (done in GUI-Backend-1) + status badge:
+  `_latest_status_per_provider()` picks the most-recently-created job per
+  provider from the registry (ties broken by insertion order, since
+  `datetime.now()` resolution isn't always fine enough to distinguish two
+  jobs created in rapid succession — a real bug caught by a flaky test,
+  fixed with `>=` instead of `>`); dashboard passes it to the template, which
+  renders `badge-status-{{ status }}` next to the tool name when present.
+- [ ] `WEB-25` Reconcile card linking to `/reconcile` — still deferred, the
+  route doesn't exist yet (lands with `GUI-Reconcile-1`)
+
+### GUI-Frontend-3 — run-a-scraper page — COMPLETE (2026-07-22)
+- [x] `WEB-26` `GET /scrape/{provider}` page (404 for unknown/disabled
+  providers) with the options form (pages/dry-run/output-dir/no-enrich)
+- [x] `WEB-27` `static/app.js` — `EventSource` wiring to the log panel
+  (unnamed `data:` = log lines), `fetch()` for start/continue/cancel. Needed
+  one backend addition beyond the original ticket scope: `_job_event_stream`
+  now emits a named `event: status` whenever `job.status` changes (not just
+  at the end), so the page knows when to show/hide the Continue button and
+  update the badge without polling — the original design only had a final
+  `event: done`, which isn't enough to react to `waiting_for_login` live.
+  Also added `GET /scrape/{provider}/jobs/{job_id}` (JSON: status, error,
+  download links) for the same reason — SSE's `done` event carries only the
+  final status string, not result paths.
+- [x] `WEB-28` Manual-login "waiting" state UI + Continue/Cancel buttons —
+  shown/hidden via the `status` SSE event
+- [x] `WEB-29` Completion summary + download links, populated from the new
+  job-detail endpoint once the `done` event fires
+- **Not automated-tested**: `app.js` itself. There's no JS test runner in
+  this repo (Python-only test stack), and adding one (Node/Jest) for ~130
+  lines of vanilla JS would be a disproportionate addition. The Python side
+  it depends on (page route, job-detail endpoint, SSE status events) is
+  fully covered — 10 new tests in `tests/test_webapp_scrape_page.py`. **Action
+  item for you**: click through `/scrape/chirp` (or any enabled provider) in
+  a real browser at least once to confirm the JS wiring actually works —
+  I verified the page renders and serves correctly via a live `uvicorn`
+  process, but never exercised the form-submit → SSE → Continue-button flow
+  end-to-end, since that needs a real scrape job (Selenium + your login).
+
+### GUI-Reconcile-1 — upload handling
+- [ ] `WEB-30` Multipart upload endpoint — size limit, CSV-shape validation
+  (not just extension/`Content-Type`), server-generated filename
+- [ ] `WEB-31` Provider source selection UI (scrape-now vs. supply an existing
+  CSV per provider)
+- [ ] `WEB-32` Tests: oversized upload, non-CSV upload, traversal-crafted filename
+
+### GUI-Reconcile-2 — reconcile job wiring
+- [ ] `WEB-33` `POST /reconcile/jobs` — background thread calling
+  `libib_reconcile`'s `run()` (from Rec-4a/Rec-4), reusing the existing job/SSE
+  infra unchanged
+- [ ] `WEB-34` `GET /reconcile/jobs/{id}/events` — reuse the SSE mechanism
+
+### GUI-Reconcile-3 — results page
+- [ ] `WEB-35` Results view: summary counts, gap/orphans/low-confidence/ambiguous
+  sections
+- [ ] `WEB-36` Per-report download links (gap CSV + each `.txt` report)
+
+### GUI-Settings-1 — settings page
+- [ ] `WEB-37` Read-only env-var status display (`configured`/`not configured`,
+  never the value) for `KINDLE_EMAIL`/`KINDLE_PASSWORD`/`AI_PROVIDER`/`OPENAI_API_KEY`
+- [ ] `WEB-38` Optional `python-dotenv` `.env` loading at startup, documented
+
+### GUI-Security-1 — hardening pass
+- [ ] `WEB-39` Origin/Referer check dependency on all `POST`/`DELETE` routes
+- [ ] `WEB-40` Full path-traversal + upload test sweep
+- [ ] `WEB-41` Review: binding, credential handling, shutdown cleanup — write up findings
+
+### GUI-Polish-1 — docs
+- [ ] `WEB-42` README — new "Web GUI" section: how to run
+  (`uvicorn webapp.main:app`), screenshots, security notes
+- [ ] `WEB-43` `docs/CLAUDE.md` — webapp architecture section + session history
+- [ ] `WEB-44` Finalize `pyproject.toml` coverage source/omit for `webapp`
+
+### New dependencies
+
+`requirements.txt` (runtime — the web app ships as part of the tool):
+`fastapi`, `uvicorn[standard]`, `jinja2`, `python-multipart` (required for
+FastAPI/Starlette form/file upload parsing), `python-dotenv`.
+
+`requirements-dev.txt`: `httpx` (FastAPI's `TestClient` is httpx-backed).
+
+No Celery/Redis/message broker — the in-memory-registry + thread + SSE design
+deliberately avoids needing one for a single-user local tool.
 
 ---
 
 ## Known Constraints & Edge Cases
 
+### Metadata enrichment — data sources
+- **Open Library** is the primary metadata source. Use ISBN lookup where available;
+  fall back to title+author search. The Works API (`/works/{id}.json`) and Editions
+  endpoint provide description, publisher, publish_date, and page count.
+- **Google Books public metadata API** (`/books/v1/volumes?q=isbn:{isbn}`) requires
+  no authentication and is used as a fallback when Open Library has no data.
+- **Price is not fetched.** No free API has reliable price coverage. If price is
+  already present in the row from the scraper, it is preserved as-is.
+- **Wikidata SPARQL** is the series source. Query by ISBN-13 (`wdt:P212`) first;
+  fall back to title+author. Extract series label (`wdt:P179`) and ordinal (`wdt:P1545`).
+  If Wikidata returns a series name but no ordinal, stamp `#ZZZ` so it's easy to find
+  and fix manually.
+
+### Series notes format
+```
+Series: The Dragon Knight #009 || Additional Notes: <original notes>
+Series: The Dragon Knight #ZZZ || Additional Notes: <original notes>
+```
+Position is always zero-padded to 3 digits. If no series data is found, `notes`
+is left unchanged and `group` is left blank.
+
+### Google Books enrichment shortcut
+The Google Books Library API already returns description, publisher, publishedDate,
+and pageCount in the volume metadata. For `google_to_libib` books that have these
+fields populated, the enricher skips Open Library and Google Books metadata calls
+entirely and only runs the Wikidata series query.
+
 ### Kindle scraper status
 The `kindle_to_libib` scraper is working correctly. It scrapes library metadata
 from the Amazon web page via Selenium and is unaffected by any DRM or epub tooling
 (e.g. Epubor). No changes needed.
-
-### Google Books — ISBNs already provided
-The Google Books API returns `industryIdentifiers` (ISBN-13 and/or ISBN-10) directly
-in the volume metadata. Open Library lookup should be skipped for Google books that
-already have an ISBN, saving API quota and time.
 
 ### Google Books — credentials file location
 Store OAuth token at `~/.config/libibtools/google_token.json` and credentials at
