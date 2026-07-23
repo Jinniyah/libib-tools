@@ -14,9 +14,13 @@ from kindle_to_libib.core import _KINDLE_UI_GARBAGE
 
 
 def test_chirp_dedupe():
+    """Same title, same author merges; same title, *different* (non-blank)
+    authors are kept as distinct books — see
+    test_dedupe_books_by_title_different_authors_kept_distinct in
+    tests/test_chirp.py for the regression test behind this."""
     books = [
         ("Title", "Author A", "cover1"),
-        ("Title", "Author B", "cover2"),
+        ("Title", "Author A", "cover2"),
     ]
     result = chirp_dedupe(books)
     assert len(result) == 1
@@ -26,7 +30,7 @@ def test_chirp_dedupe():
 def test_kindle_dedupe():
     books = [
         ("Title", "Author A", "cover1"),
-        ("Title", "Author B", "cover2"),
+        ("Title", "Author A", "cover2"),
     ]
     result = kindle_dedupe(books)
     assert len(result) == 1

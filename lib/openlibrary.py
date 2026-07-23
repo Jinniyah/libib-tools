@@ -231,25 +231,81 @@ def sleep_between_requests() -> None:
 
 def dedupe_books_by_title(
     books: list[tuple[str, str, str]],
+    dropped: Optional[list[tuple[str, str, str]]] = None,
 ) -> list[tuple[str, str, str]]:
-    """Remove duplicate titles, preferring entries that have an author."""
-    seen: dict[str, int] = {}
+    """Remove duplicate titles, preferring entries that have an author.
+
+    Grouped by title, but two entries sharing a title are only treated as
+    the *same* book if their authors match (or one side's author is blank —
+    recovering from the same book being scraped twice where one copy's
+    author extraction glitched to blank). Two different, non-blank authors
+    under the same title are kept as distinct books rather than merged —
+    confirmed as a real, live false-positive: 'Apex' by Mercedes Lackey was
+    getting silently dropped as a "duplicate" of the unrelated 'Apex' by
+    Seth Ring under the previous title-only key.
+
+    If ``dropped`` is given, every entry actually removed (not merely
+    replaced — a blank-author entry being swapped for a better copy of the
+    same book isn't a loss) is appended to it as (title, author, reason), so
+    a caller can write out a human-reviewable report rather than relying on
+    scrollback logs — false positives here are silent by nature (a "removed"
+    book just isn't in the output) unless someone can see what was dropped.
+    """
+    seen: dict[str, list[int]] = {}
     unique: list[tuple[str, str, str]] = []
     removed = replaced = 0
 
     for title, author, cover in books:
         key = (title or "").strip().lower()
-        if key not in seen:
-            seen[key] = len(unique)
-            unique.append((title, author, cover))
-        else:
-            idx = seen[key]
+        author_norm = (author or "").strip().lower()
+
+        match_idx = None
+        for idx in seen.get(key, []):
             _, existing_author, _ = unique[idx]
-            if not existing_author and author:
-                unique[idx] = (title, author, cover)
-                replaced += 1
-            else:
-                removed += 1
+            existing_author_norm = (existing_author or "").strip().lower()
+            if (
+                not existing_author_norm
+                or not author_norm
+                or existing_author_norm == author_norm
+            ):
+                match_idx = idx
+                break
+
+        if match_idx is None:
+            seen.setdefault(key, []).append(len(unique))
+            unique.append((title, author, cover))
+            continue
+
+        existing_title, existing_author, _ = unique[match_idx]
+        if not existing_author and author:
+            log.info(
+                "Deduplication: replacing blank-author entry '%s' with "
+                "'%s' by '%s'.",
+                existing_title,
+                title,
+                author,
+            )
+            unique[match_idx] = (title, author, cover)
+            replaced += 1
+        else:
+            log.info(
+                "Deduplication: dropping '%s' by '%s' as a duplicate of "
+                "'%s' by '%s'.",
+                title,
+                author,
+                existing_title,
+                existing_author,
+            )
+            if dropped is not None:
+                dropped.append(
+                    (
+                        title,
+                        author,
+                        f"Deduplication: duplicate of '{existing_title}' by "
+                        f"'{existing_author}'",
+                    )
+                )
+            removed += 1
 
     if removed or replaced:
         log.info("Deduplication: %d removed, %d replaced.", removed, replaced)
@@ -259,12 +315,18 @@ def dedupe_books_by_title(
 def filter_invalid_books(
     books: list[tuple[str, str, str]],
     extra_garbage: frozenset[str] = frozenset(),
+    dropped: Optional[list[tuple[str, str, str]]] = None,
 ) -> list[tuple[str, str, str]]:
     """
     Drop entries with missing, trivial, or garbage titles.
 
     Pass ``extra_garbage`` to add platform-specific junk titles
     (e.g. Kindle UI strings) without touching shared logic.
+
+    If ``dropped`` is given, every removed entry is appended to it as
+    (title, author, reason) — see dedupe_books_by_title's docstring for why:
+    a filtered-out book is a silent loss unless something records what was
+    dropped and why, for a human to check for false positives.
     """
     _BASE_GARBAGE = frozenset({"audiobook", "book", "ebook"})
     garbage = _BASE_GARBAGE | extra_garbage
@@ -275,12 +337,27 @@ def filter_invalid_books(
     for title, author, cover in books:
         t = (title or "").strip()
         if not t or len(re.findall(r"[A-Za-z0-9]", t)) < 2:
+            reason = (
+                "Filter: blank, or fewer than 2 alphanumeric characters "
+                "(also rejects titles entirely in non-Latin script)"
+            )
+            log.info("Filtered invalid title (%s): %r by %r", reason, title, author)
+            if dropped is not None:
+                dropped.append((title, author, reason))
             removed += 1
             continue
         if t.lower() in garbage:
+            reason = f"Filter: matched a generic placeholder word '{t.lower()}'"
+            log.info("Filtered invalid title (%s): %r by %r", reason, title, author)
+            if dropped is not None:
+                dropped.append((title, author, reason))
             removed += 1
             continue
         if re.match(r"^[\W_]+$", t):
+            reason = "Filter: no word characters at all"
+            log.info("Filtered invalid title (%s): %r by %r", reason, title, author)
+            if dropped is not None:
+                dropped.append((title, author, reason))
             removed += 1
             continue
         valid.append((title, author, cover))

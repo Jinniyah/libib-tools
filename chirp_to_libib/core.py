@@ -28,6 +28,7 @@ from lib import (
 )
 
 from selenium import webdriver
+from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -45,6 +46,15 @@ ENRICH_LOG_INTERVAL: int = 25
 PAGE_WAIT_TIMEOUT: int = 30  # seconds
 LIBIB_TYPE = "chirp,audiobook"
 
+# Confirmed from a real DOM capture (2026-07-23): each book card is
+# `<div data-testid="user-audiobook-card">`. The previous selector
+# (`//div[.//a[starts-with(@href,'/audiobooks/')]]`) matched every ancestor
+# wrapping that card too — the title `<div>` itself, the `role="listitem"`
+# wrapper, and an animation wrapper div all also "contain" the /audiobooks/
+# link as a descendant — 4 matches per real book, which is exactly why raw
+# per-page counts (113-195) were running ~5-10x the real ~20 books/page.
+_SEL_BOOK_ITEM = "div[data-testid='user-audiobook-card']"
+
 # Used in place of a real EnrichmentResult when --no-enrich is set.
 _NULL_ENRICHMENT = EnrichmentResult()
 
@@ -55,6 +65,7 @@ class RunResult:
     unresolved_path: Optional[str]
     total_books: int
     resolved_count: int
+    dropped_path: Optional[str] = None
 
 
 # ==========================
@@ -192,17 +203,29 @@ def _output_path(directory: str, filename: str) -> str:
     return os.path.join(directory, filename)
 
 
+def _element_text(el: WebElement) -> str:
+    """Prefer textContent over .text: .text is defined to depend on the
+    element actually being rendered/visible, so it reads as "" for anything
+    still mid-CSS-transition (this grid wraps every card in `transition:
+    opacity 400ms, transform 400ms` — confirmed from a real DOM capture) —
+    confirmed live as the source of several books coming back with a real
+    author but a blank title. textContent reads the DOM's actual text
+    regardless of render/animation state."""
+    content = el.get_attribute("textContent")
+    return content.strip() if content else el.text.strip()
+
+
 def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str]]:
     books = []
     for item in items:
         try:
             title_el = item.find_element(By.CSS_SELECTOR, "a[href^='/audiobooks/']")
-            title = title_el.text.strip()
+            title = _element_text(title_el)
 
             try:
-                byline = item.find_element(
-                    By.CSS_SELECTOR, "div[class*='byline']"
-                ).text.strip()
+                byline = _element_text(
+                    item.find_element(By.CSS_SELECTOR, "div[class*='byline']")
+                )
             except Exception:
                 byline = ""
 
@@ -247,14 +270,10 @@ def scrape_chirp(
             log.info("Scraping page %d…", page_number)
 
             WebDriverWait(driver, PAGE_WAIT_TIMEOUT).until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//div[.//a[starts-with(@href,'/audiobooks/')]]")
-                )
+                EC.presence_of_element_located((By.CSS_SELECTOR, _SEL_BOOK_ITEM))
             )
 
-            items = driver.find_elements(
-                By.XPATH, "//div[.//a[starts-with(@href,'/audiobooks/')]]"
-            )
+            items = driver.find_elements(By.CSS_SELECTOR, _SEL_BOOK_ITEM)
             page_books = _parse_items(items)
             books.extend(page_books)
 
@@ -273,8 +292,62 @@ def scrape_chirp(
                 log.info("No further pages found.")
                 break
 
+            # Chirp's library grid is a client-side (React) re-render, not a
+            # full page navigation — clicking Next doesn't guarantee the old
+            # items are gone by the time the loop comes back around. Without
+            # this, the top-of-loop presence-of-element wait can resolve
+            # instantly against the *old* page's still-present items, so the
+            # code silently re-scrapes the same page instead of advancing.
+            #
+            # staleness_of(the first old item) was tried first and doesn't
+            # work here — confirmed live: it timed out after a full
+            # PAGE_WAIT_TIMEOUT even though the page had genuinely changed,
+            # meaning React is reusing/mutating the same DOM node in place
+            # for list position 1 rather than unmounting it, so the node
+            # reference never actually goes stale. Comparing the *rendered
+            # text* of that position instead works regardless of whether the
+            # underlying node identity changed.
+            #
+            # Both reads below use _element_text (textContent, not .text) and
+            # are wrapped against StaleElementReferenceException: the grid
+            # can still be re-rendering while we read it, and
+            # WebDriverWait.until() only ignores NoSuchElementException by
+            # default — a stale-element read during a poll would otherwise
+            # crash the whole job immediately instead of just being treated
+            # as "not yet advanced, keep polling" (confirmed live: this
+            # crashed a real run with exactly that exception, fast, not a
+            # timeout). Using .text here specifically (rather than
+            # textContent) was the root cause of a related bug: .text goes
+            # blank while an element is mid-transition, which could make this
+            # check fire the instant the *old* card started fading out —
+            # before the new one had actually rendered — triggering an early
+            # read of all ~20 cards while several were still blank.
+            try:
+                prev_first_item_text = _element_text(items[0]) if items else None
+            except StaleElementReferenceException:
+                prev_first_item_text = None
+
             next_el[0].click()
             page_number += 1
+
+            if prev_first_item_text is not None:
+
+                def _page_advanced(d: webdriver.Chrome) -> bool:
+                    current = d.find_elements(By.CSS_SELECTOR, _SEL_BOOK_ITEM)
+                    if not current:
+                        return False
+                    try:
+                        return _element_text(current[0]) != prev_first_item_text
+                    except StaleElementReferenceException:
+                        return False
+
+                WebDriverWait(driver, PAGE_WAIT_TIMEOUT).until(_page_advanced)
+
+                # Extra safety margin on top of the textContent fix above —
+                # cheap insurance in case some other part of the card (e.g.
+                # an image) is still settling even once its text content is
+                # correct.
+                time.sleep(0.5)
 
         return books
     finally:
@@ -412,6 +485,31 @@ def write_unresolved(
     return path
 
 
+def write_dropped_report(
+    dropped: list[tuple[str, str, str]],
+    output_dir: str,
+) -> Optional[str]:
+    """Books filter_invalid_books()/dedupe_books_by_title() removed before
+    they ever reached ISBN resolution — a durable, human-reviewable record
+    of exactly what was dropped and why, since these are silent by nature
+    otherwise (a dropped book just isn't in the output CSV)."""
+    if not dropped:
+        return None
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    path = _output_path(output_dir, f"chirp_to_libib_dropped_{timestamp}.txt")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            "Books filtered out or deduplicated before ISBN lookup — review for false positives\n"
+        )
+        f.write("=" * 82 + "\n\n")
+        for title, author, reason in dropped:
+            f.write(f"{title!r} by {author!r}\n    {reason}\n\n")
+
+    return path
+
+
 # ==========================
 # MAIN PIPELINE
 # ==========================
@@ -441,7 +539,8 @@ def run(
     # os.environ.pop("CHIRP_EMAIL", None)
     # os.environ.pop("CHIRP_PASSWORD", None)
 
-    books = filter_invalid_books(books)
+    dropped: list[tuple[str, str, str]] = []
+    books = filter_invalid_books(books, dropped=dropped)
 
     if not books:
         log.error("No books were scraped. Exiting.")
@@ -450,7 +549,7 @@ def run(
         )
 
     log.info("Found %d book(s). Deduplicating…", len(books))
-    books_deduped = dedupe_books_by_title(books)
+    books_deduped = dedupe_books_by_title(books, dropped=dropped)
 
     log.info("Found %d book(s). Resolving ISBNs via Open Library…", len(books_deduped))
     records = resolve_isbns(books_deduped, cancel_fn=cancel_fn)
@@ -493,11 +592,16 @@ def run(
     if unresolved_path:
         log.info("Unresolved titles written to: %s", unresolved_path)
 
+    dropped_path = write_dropped_report(dropped, output_dir)
+    if dropped_path:
+        log.info("Filtered/deduplicated books written to: %s", dropped_path)
+
     return RunResult(
         csv_path=csv_path,
         unresolved_path=unresolved_path,
         total_books=len(records),
         resolved_count=resolved,
+        dropped_path=dropped_path,
     )
 
 

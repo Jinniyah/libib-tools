@@ -9,6 +9,7 @@ from kobo_to_libib.core import (
     resolve_isbns,
     run,
     write_csv,
+    write_dropped_report,
     write_unresolved,
 )
 from lib import (
@@ -35,6 +36,7 @@ def _make_mock_item(title="", author="", cover=""):
     title_el.text = title
 
     author_el = MagicMock()
+    author_el.get_attribute.return_value = author or None
     author_el.text = author
 
     img_el = MagicMock()
@@ -308,4 +310,30 @@ def test_write_unresolved_returns_none_when_all_resolved():
     records = [("Dune", "Frank Herbert", "9781402894626", "cover", EMPTY)]
     with tempfile.TemporaryDirectory() as tmp:
         result = write_unresolved(records, tmp)
+    assert result is None
+
+
+def test_write_dropped_report_creates_file():
+    dropped = [
+        ("", "Some Author", "Filter: blank, or fewer than 2 alphanumeric characters"),
+        (
+            "Apex",
+            "Mercedes Lackey",
+            "Deduplication: duplicate of 'Apex' by 'Seth Ring'",
+        ),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write_dropped_report(dropped, tmp)
+        assert path is not None
+        assert os.path.exists(path)
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    assert "Some Author" in text
+    assert "Apex" in text
+    assert "Seth Ring" in text
+
+
+def test_write_dropped_report_returns_none_when_nothing_dropped():
+    with tempfile.TemporaryDirectory() as tmp:
+        result = write_dropped_report([], tmp)
     assert result is None

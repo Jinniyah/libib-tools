@@ -50,6 +50,7 @@ class RunResult:
     unresolved_path: Optional[str]
     total_books: int
     resolved_count: int
+    dropped_path: Optional[str] = None
 
 
 # Kobo library URL — the locale segment (us/en) varies by account region.
@@ -228,6 +229,17 @@ def _output_path(directory: str, filename: str) -> str:
     return os.path.join(directory, filename)
 
 
+def _element_text(el: WebElement) -> str:
+    """Prefer textContent over .text: .text is defined to depend on the
+    element actually being rendered/visible, so it reads as "" for anything
+    still mid-render/transition — confirmed live on Chirp's identical
+    pattern as the source of books coming back with a real author but a
+    blank title. textContent reads the DOM's actual text regardless of
+    render/animation state."""
+    content = el.get_attribute("textContent")
+    return content.strip() if content else el.text.strip()
+
+
 def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str]]:
     """Extract (title, author, cover_url) from a list of li.item-wrapper.book elements."""
     books = []
@@ -237,7 +249,7 @@ def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str]]:
             title = ""
             try:
                 title_el = item.find_element(By.CSS_SELECTOR, _SEL_TITLE)
-                title = title_el.text.strip()
+                title = _element_text(title_el)
             except Exception:
                 pass
 
@@ -247,7 +259,7 @@ def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str]]:
             author = ""
             try:
                 author_el = item.find_element(By.CSS_SELECTOR, _SEL_AUTHOR)
-                author = author_el.text.strip()
+                author = _element_text(author_el)
             except Exception:
                 pass
 
@@ -450,6 +462,32 @@ def write_unresolved(
     return path
 
 
+def write_dropped_report(
+    dropped: list[tuple[str, str, str]],
+    output_dir: str,
+) -> Optional[str]:
+    """Books filter_invalid_books()/dedupe_books_by_title() removed before
+    they ever reached ISBN resolution — a durable, human-reviewable record
+    of exactly what was dropped and why, since these are silent by nature
+    otherwise (a dropped book just isn't in the output CSV)."""
+    if not dropped:
+        return None
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    path = _output_path(output_dir, f"kobo_to_libib_dropped_{timestamp}.txt")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            "Books filtered out or deduplicated before ISBN lookup — "
+            "review for false positives\n"
+        )
+        f.write("=" * 70 + "\n\n")
+        for title, author, reason in dropped:
+            f.write(f"{title!r} by {author!r}\n    {reason}\n\n")
+
+    return path
+
+
 # ==========================
 # MAIN PIPELINE
 # ==========================
@@ -471,7 +509,8 @@ def run(
     log.info("Starting Kobo library scrape…")
     books = scrape_kobo(max_pages=pages, wait_fn=wait_fn, cancel_fn=cancel_fn)
 
-    books = filter_invalid_books(books)
+    dropped: list[tuple[str, str, str]] = []
+    books = filter_invalid_books(books, dropped=dropped)
 
     if not books:
         log.error("No books were scraped. Exiting.")
@@ -480,7 +519,7 @@ def run(
         )
 
     log.info("Found %d book(s). Deduplicating…", len(books))
-    books = dedupe_books_by_title(books)
+    books = dedupe_books_by_title(books, dropped=dropped)
 
     log.info("Found %d book(s). Resolving ISBNs via Open Library…", len(books))
     records = resolve_isbns(books, cancel_fn=cancel_fn)
@@ -523,11 +562,16 @@ def run(
     if unresolved_path:
         log.info("Unresolved titles written to: %s", unresolved_path)
 
+    dropped_path = write_dropped_report(dropped, output_dir)
+    if dropped_path:
+        log.info("Filtered/deduplicated books written to: %s", dropped_path)
+
     return RunResult(
         csv_path=csv_path,
         unresolved_path=unresolved_path,
         total_books=len(records),
         resolved_count=resolved,
+        dropped_path=dropped_path,
     )
 
 

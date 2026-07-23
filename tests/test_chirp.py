@@ -11,13 +11,25 @@ from chirp_to_libib.core import (
 )
 
 
-def test_dedupe_books_by_title():
+def test_dedupe_books_by_title_same_author_merges():
+    books = [
+        ("Title", "Author A", "cover1"),
+        ("Title", "Author A", "cover2"),
+    ]
+    result = dedupe_books_by_title(books)
+    assert len(result) == 1
+
+
+def test_dedupe_books_by_title_different_authors_kept_distinct():
+    """Same title, different (non-blank) authors are different books, not a
+    duplicate — regression test for a real bug: 'Apex' by Mercedes Lackey was
+    silently dropped as a "duplicate" of the unrelated 'Apex' by Seth Ring."""
     books = [
         ("Title", "Author A", "cover1"),
         ("Title", "Author B", "cover2"),
     ]
     result = dedupe_books_by_title(books)
-    assert len(result) == 1
+    assert len(result) == 2
 
 
 def test_filter_invalid_books():

@@ -90,6 +90,39 @@ def test_run_returns_paths_and_counts(
     assert result.resolved_count == 1
 
 
+@patch("chirp_to_libib.core.write_unresolved", return_value=None)
+@patch("chirp_to_libib.core.write_csv", return_value="/out/chirp_to_libib_x.csv")
+@patch("chirp_to_libib.core.enrich_book", return_value=EnrichmentResult())
+@patch("chirp_to_libib.core.sleep_between_requests")
+@patch("chirp_to_libib.core.get_isbn", return_value="1234567890")
+@patch("chirp_to_libib.core.scrape_chirp")
+def test_run_writes_dropped_report_when_books_are_filtered(
+    mock_scrape,
+    mock_get_isbn,
+    mock_sleep,
+    mock_enrich_book,
+    mock_write_csv,
+    mock_write_unresolved,
+    tmp_path,
+):
+    """A blank title should be filtered before ISBN lookup (real
+    filter_invalid_books/dedupe_books_by_title run here, unmocked) and land
+    in a real, human-reviewable dropped-books report — not just scrollback
+    logs, per the user's ask to make dropped books verifiable."""
+    mock_scrape.return_value = [
+        ("Valid Title", "Author A", "coverA"),
+        ("", "Author B", "coverB"),
+    ]
+
+    result = run(output_dir=str(tmp_path))
+
+    assert result.dropped_path is not None
+    with open(result.dropped_path, encoding="utf-8") as f:
+        text = f.read()
+    assert "Author B" in text
+    assert mock_get_isbn.call_count == 1  # only the valid book reaches ISBN lookup
+
+
 @patch("chirp_to_libib.core.write_unresolved")
 @patch("chirp_to_libib.core.write_csv")
 @patch("chirp_to_libib.core.enrich_book", return_value=EnrichmentResult())

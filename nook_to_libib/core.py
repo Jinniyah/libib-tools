@@ -51,6 +51,7 @@ class RunResult:
     unresolved_path: Optional[str]
     total_books: int
     resolved_count: int
+    dropped_path: Optional[str] = None
 
 
 # Nook library URL — this is where the confirmed DOM selectors below were
@@ -178,6 +179,17 @@ def _output_path(directory: str, filename: str) -> str:
     return os.path.join(directory, filename)
 
 
+def _element_text(el: WebElement) -> str:
+    """Prefer textContent over .text: .text is defined to depend on the
+    element actually being rendered/visible, so it reads as "" for anything
+    still mid-render/transition — confirmed live on Chirp's identical
+    pattern as the source of books coming back with a real author but a
+    blank title. textContent reads the DOM's actual text regardless of
+    render/animation state."""
+    content = el.get_attribute("textContent")
+    return content.strip() if content else el.text.strip()
+
+
 def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str, str]]:
     """Extract (title, author, isbn, cover_url).
 
@@ -194,7 +206,8 @@ def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str, str]]
             try:
                 title_el = item.find_element(By.CSS_SELECTOR, _SEL_TITLE)
                 title = (
-                    title_el.get_attribute("data-product-title") or title_el.text
+                    title_el.get_attribute("data-product-title")
+                    or _element_text(title_el)
                 ).strip()
             except Exception:
                 pass
@@ -202,7 +215,7 @@ def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str, str]]
             author = ""
             try:
                 author_el = item.find_element(By.CSS_SELECTOR, _SEL_AUTHOR)
-                author = author_el.text.strip()
+                author = _element_text(author_el)
             except Exception:
                 pass
 
@@ -263,6 +276,7 @@ def scrape_nook(
 
 def _dedupe_and_filter(
     books: list[tuple[str, str, str, str]],
+    dropped: Optional[list[tuple[str, str, str]]] = None,
 ) -> list[tuple[str, str, str, str]]:
     """Filter and dedupe via the shared lib helpers, which are typed for 3-tuples
     of (title, author, cover). Nook already has the ISBN up front, and ISBN is a
@@ -273,8 +287,8 @@ def _dedupe_and_filter(
     cover_by_isbn = {isbn: cover for _, _, isbn, cover in books if isbn}
 
     projected = [(title, author, isbn) for title, author, isbn, _ in books]
-    projected = filter_invalid_books(projected)
-    projected = dedupe_books_by_title(projected)
+    projected = filter_invalid_books(projected, dropped=dropped)
+    projected = dedupe_books_by_title(projected, dropped=dropped)
 
     return [
         (title, author, isbn, cover_by_isbn.get(isbn, ""))
@@ -421,6 +435,32 @@ def write_unresolved(
     return path
 
 
+def write_dropped_report(
+    dropped: list[tuple[str, str, str]],
+    output_dir: str,
+) -> Optional[str]:
+    """Books filter_invalid_books()/dedupe_books_by_title() removed before
+    they ever reached ISBN resolution — a durable, human-reviewable record
+    of exactly what was dropped and why, since these are silent by nature
+    otherwise (a dropped book just isn't in the output CSV)."""
+    if not dropped:
+        return None
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    path = _output_path(output_dir, f"nook_to_libib_dropped_{timestamp}.txt")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            "Books filtered out or deduplicated before ISBN lookup — "
+            "review for false positives\n"
+        )
+        f.write("=" * 70 + "\n\n")
+        for title, author, reason in dropped:
+            f.write(f"{title!r} by {author!r}\n    {reason}\n\n")
+
+    return path
+
+
 # ==========================
 # MAIN PIPELINE
 # ==========================
@@ -448,8 +488,9 @@ def run(
             csv_path=None, unresolved_path=None, total_books=0, resolved_count=0
         )
 
+    dropped: list[tuple[str, str, str]] = []
     log.info("Found %d book(s). Filtering and deduplicating…", len(books))
-    books = _dedupe_and_filter(books)
+    books = _dedupe_and_filter(books, dropped=dropped)
 
     log.info("Found %d book(s). Resolving missing ISBNs via Open Library…", len(books))
     records = resolve_isbns(books, cancel_fn=cancel_fn)
@@ -492,11 +533,16 @@ def run(
     if unresolved_path:
         log.info("Unresolved titles written to: %s", unresolved_path)
 
+    dropped_path = write_dropped_report(dropped, output_dir)
+    if dropped_path:
+        log.info("Filtered/deduplicated books written to: %s", dropped_path)
+
     return RunResult(
         csv_path=csv_path,
         unresolved_path=unresolved_path,
         total_books=len(records),
         resolved_count=resolved,
+        dropped_path=dropped_path,
     )
 
 

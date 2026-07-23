@@ -25,6 +25,7 @@ from lib import (
 )
 
 from selenium import webdriver
+from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -52,6 +53,7 @@ class RunResult:
     unresolved_path: Optional[str]
     total_books: int
     resolved_count: int
+    dropped_path: Optional[str] = None
 
 
 KINDLE_LIBRARY_URL: str = (
@@ -211,6 +213,17 @@ def _output_path(directory: str, filename: str) -> str:
     return os.path.join(directory, filename)
 
 
+def _element_text(el: WebElement) -> str:
+    """Prefer textContent over .text: .text is defined to depend on the
+    element actually being rendered/visible, so it reads as "" for anything
+    still mid-render/transition — confirmed live on Chirp's identical
+    pattern as the source of books coming back with a real author but a
+    blank title. textContent reads the DOM's actual text regardless of
+    render/animation state."""
+    content = el.get_attribute("textContent")
+    return content.strip() if content else el.text.strip()
+
+
 def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str]]:
     books = []
     for item in items:
@@ -222,13 +235,13 @@ def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str]]:
                     By.CSS_SELECTOR,
                     "[data-testid='title'], [data-testid='entity-title']",
                 )
-                title = title_el.text.strip()
+                title = _element_text(title_el)
             except Exception:
                 try:
                     title_el = item.find_element(
                         By.CSS_SELECTOR, "span[class*='title'], div[class*='title']"
                     )
-                    title = title_el.text.strip()
+                    title = _element_text(title_el)
                 except Exception:
                     try:
                         title_el = item.find_element(
@@ -236,7 +249,7 @@ def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str]]:
                             ".//a[normalize-space(text())!=''][1] | "
                             ".//span[normalize-space(text())!=''][1]",
                         )
-                        title = title_el.text.strip()
+                        title = _element_text(title_el)
                     except Exception:
                         title = ""
 
@@ -246,13 +259,13 @@ def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str]]:
                 author_el = item.find_element(
                     By.CSS_SELECTOR, "div.information_row[id^='content-author']"
                 )
-                author = author_el.text.strip()
+                author = _element_text(author_el)
             except Exception:
                 try:
                     author_el = item.find_element(
                         By.CSS_SELECTOR, "div.information_row"
                     )
-                    author = author_el.text.strip()
+                    author = _element_text(author_el)
                 except Exception:
                     author = ""
 
@@ -329,6 +342,39 @@ def scrape_kindle(
             # Try to find the specific page number link (e.g., "page-2", "page-3")
             specific_page = driver.find_elements(By.ID, f"page-{next_page_num}")
 
+            # A flat time.sleep() here only hopes Amazon's dynamic content
+            # swap finishes in time — on a slow load it doesn't, and the
+            # top-of-loop presence-of-element wait then resolves against the
+            # *old* page's still-present items, silently re-scraping the same
+            # page instead of advancing.
+            #
+            # staleness_of() was tried first (see Chirp's identical fix,
+            # confirmed live) and doesn't reliably work for this class of
+            # site: a dynamically-updated grid can reuse/mutate the same DOM
+            # node in place for list position 1 rather than unmounting it, so
+            # the node reference never actually goes stale even though the
+            # page changed. Comparing the *rendered text* of that position
+            # instead works regardless of whether the node identity did.
+            #
+            # Both reads below use _element_text (textContent, not .text)
+            # and are wrapped against StaleElementReferenceException: the
+            # grid can still be re-rendering while we read it, and
+            # WebDriverWait.until() only ignores NoSuchElementException by
+            # default — a stale-element read during a poll would otherwise
+            # crash the whole job immediately instead of being treated as
+            # "not yet advanced, keep polling" (confirmed live on Chirp's
+            # identical pattern: crashed a real run with exactly that
+            # exception, fast, not a timeout). Using .text here specifically
+            # was also the root cause of a related bug on Chirp: .text goes
+            # blank while an element is mid-transition, which could make
+            # this check fire the instant the old row started changing —
+            # before the new one had actually rendered — triggering an early
+            # read of every row while several were still blank.
+            try:
+                prev_first_item_text = _element_text(items[0]) if items else None
+            except StaleElementReferenceException:
+                prev_first_item_text = None
+
             if specific_page:
                 specific_page[0].click()
             else:
@@ -341,7 +387,33 @@ def scrape_kindle(
                 next_window[0].click()
 
             page_number += 1
-            time.sleep(5)  # Wait for Amazon's dynamic content to swap in
+
+            if prev_first_item_text is not None:
+
+                def _page_advanced(d: webdriver.Chrome) -> bool:
+                    current = d.find_elements(
+                        By.CSS_SELECTOR, "tr[role='listitem'], div[role='listitem']"
+                    )
+                    if not current:
+                        return False
+                    try:
+                        return _element_text(current[0]) != prev_first_item_text
+                    except StaleElementReferenceException:
+                        return False
+
+                WebDriverWait(driver, PAGE_WAIT_TIMEOUT).until(_page_advanced)
+
+                # _page_advanced only confirms the *first* row's text has
+                # changed — not that every row on the new page has finished
+                # rendering. Reading immediately after can catch later rows
+                # mid-swap, before their title text is populated, even though
+                # sibling fields may already be readable (confirmed on
+                # Chirp's identical pattern: several books came back with a
+                # real author but a blank title). A short settle buffer
+                # avoids this.
+                time.sleep(0.5)
+            else:
+                time.sleep(5)
 
         return books
     finally:
@@ -479,6 +551,32 @@ def write_unresolved(
     return path
 
 
+def write_dropped_report(
+    dropped: list[tuple[str, str, str]],
+    output_dir: str,
+) -> Optional[str]:
+    """Books filter_invalid_books()/dedupe_books_by_title() removed before
+    they ever reached ISBN resolution — a durable, human-reviewable record
+    of exactly what was dropped and why, since these are silent by nature
+    otherwise (a dropped book just isn't in the output CSV)."""
+    if not dropped:
+        return None
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    path = _output_path(output_dir, f"kindle_to_libib_dropped_{timestamp}.txt")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            "Books filtered out or deduplicated before ISBN lookup — "
+            "review for false positives\n"
+        )
+        f.write("=" * 70 + "\n\n")
+        for title, author, reason in dropped:
+            f.write(f"{title!r} by {author!r}\n    {reason}\n\n")
+
+    return path
+
+
 # ==========================
 # MAIN PIPELINE
 # ==========================
@@ -486,8 +584,11 @@ def write_unresolved(
 
 def _filter_kindle_books(
     books: list[tuple[str, str, str]],
+    dropped: Optional[list[tuple[str, str, str]]] = None,
 ) -> list[tuple[str, str, str]]:
-    return filter_invalid_books(books, extra_garbage=_KINDLE_UI_GARBAGE)
+    return filter_invalid_books(
+        books, extra_garbage=_KINDLE_UI_GARBAGE, dropped=dropped
+    )
 
 
 def run(
@@ -521,9 +622,10 @@ def run(
     os.environ.pop("KINDLE_EMAIL", None)
     os.environ.pop("KINDLE_PASSWORD", None)
 
+    dropped: list[tuple[str, str, str]] = []
     log.info("Found %d book(s). Deduplicating…", len(books))
-    books = dedupe_books_by_title(books)
-    books = _filter_kindle_books(books)
+    books = dedupe_books_by_title(books, dropped=dropped)
+    books = _filter_kindle_books(books, dropped=dropped)
 
     if not books:
         log.error("No books were scraped. Exiting.")
@@ -572,11 +674,16 @@ def run(
     if unresolved_path:
         log.info("Unresolved titles written to: %s", unresolved_path)
 
+    dropped_path = write_dropped_report(dropped, output_dir)
+    if dropped_path:
+        log.info("Filtered/deduplicated books written to: %s", dropped_path)
+
     return RunResult(
         csv_path=csv_path,
         unresolved_path=unresolved_path,
         total_books=len(records),
         resolved_count=resolved,
+        dropped_path=dropped_path,
     )
 
 

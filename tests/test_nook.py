@@ -33,6 +33,7 @@ def _make_mock_item(title="", author="", isbn="", cover=""):
     title_el.text = title
 
     author_el = MagicMock()
+    author_el.get_attribute.return_value = author or None
     author_el.text = author
 
     img_el = MagicMock()
@@ -117,13 +118,28 @@ def test_dedupe_and_filter_removes_invalid_titles():
     assert result[0][0] == "Good Book"
 
 
-def test_dedupe_and_filter_isbn_keyed_reattachment():
-    """Same-title books from different authors dedupe down to one entry (title
-    dedup is a lib limitation), but whichever entry survives must keep its own
-    cover — looked up by ISBN, not accidentally swapped with the other book's."""
+def test_dedupe_and_filter_keeps_different_authors_distinct():
+    """Same title, different (non-blank) authors are different books, not a
+    duplicate — dedupe_books_by_title only merges same-title entries when
+    the author also matches (or is blank). Each keeps its own correct
+    isbn/cover, with no merge (and so no swap risk) between them."""
     books = [
         ("Same Title", "Author A", "1111111111111", "coverA"),
         ("Same Title", "Author B", "2222222222222", "coverB"),
+    ]
+    result = _dedupe_and_filter(books)
+    assert len(result) == 2
+    covers_by_isbn = {isbn: cover for _, _, isbn, cover in result}
+    assert covers_by_isbn == {"1111111111111": "coverA", "2222222222222": "coverB"}
+
+
+def test_dedupe_and_filter_isbn_keyed_reattachment_for_genuine_duplicate():
+    """Same title *and* same author dedupe down to one entry (a genuine
+    duplicate), and the surviving entry must keep its own cover — looked up
+    by ISBN, not accidentally swapped with the other book's."""
+    books = [
+        ("Same Title", "Author A", "1111111111111", "coverA"),
+        ("Same Title", "Author A", "2222222222222", "coverB"),
     ]
     result = _dedupe_and_filter(books)
     assert len(result) == 1
