@@ -16,6 +16,7 @@
 .vs/
 .venv/
 .env/
+.env
 .coverage
 htmlcov/
 __pycache__/

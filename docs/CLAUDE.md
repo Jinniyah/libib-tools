@@ -40,7 +40,9 @@ libib-tools/
 ├── lib/                   # Shared logic (all scrapers import from here)
 │   ├── __init__.py
 │   ├── openlibrary.py
-│   └── enricher.py        # Metadata + series enrichment (complete)
+│   ├── enricher.py        # Metadata + series enrichment (complete)
+│   ├── http_retry.py      # Shared GET-with-retry (429/Retry-After handling, cancel_fn)
+│   └── cancellation.py    # OperationCancelled — shared cancel signal
 ├── libib_reconcile/       # Reconciliation tool (COMPLETE — Rec-1 through Rec-4; Rec-5 integration/polish remains)
 │   ├── __init__.py
 │   ├── __main__.py
@@ -157,6 +159,7 @@ or `lib.enricher` directly in new code — always use `from lib import ...`.
 | `filter_invalid_books(books)` | Drop empty/garbage titles |
 | `enrich_book(...)` | Metadata + series enrichment — see Enricher section *(PLANNED)* |
 | `format_series_notes(...)` | Format series prefix for `notes` column *(PLANNED)* |
+| `OperationCancelled` | Shared cancellation exception (`lib/cancellation.py`) — raised by `get_isbn()`/`enrich_book()`/scraper cores when a caller-supplied `cancel_fn` reports `True`; caught by `webapp/jobs/runner.py` |
 
 ### Internal helpers in `lib/openlibrary.py` (not exported, but available for reuse)
 
@@ -166,6 +169,19 @@ or `lib.enricher` directly in new code — always use `from lib import ...`.
 | `_valid_isbn13(s)` | Validates ISBN-13 checksum |
 | `_valid_isbn10(s)` | Validates ISBN-10 checksum |
 | `_best_isbn(isbns)` | Picks best ISBN from a list (prefers ISBN-13) |
+
+### `lib/http_retry.py` (not exported via `lib/__init__.py` — internal to `lib/`)
+
+`request_json(url, context, *, params=None, headers=None, max_retries=3,
+base_backoff=2.0, cancel_fn=None)` — the single GET-with-retry helper used by
+both `lib/enricher.py`'s `_http_get_json` and `lib/openlibrary.py`'s
+`_ol_query` (previously duplicated between the two, and already drifted: 3 vs
+4 `max_retries`). Handles HTTP 429 distinctly — honors `Retry-After` when
+present, otherwise waits at least 5s, since the plain exponential backoff
+used for other errors is provably too short against Google Books' actual
+rate-limit window (observed 3 consecutive 429s at 2s/4s/8s spacing). Accepts
+an optional `cancel_fn` so a cancel request lands within ~1s even mid-retry,
+instead of waiting out the full backoff/Retry-After chain.
 
 ---
 
@@ -225,6 +241,7 @@ Each scraper's pipeline above lives inside a callable `run()`, not inline in
 def run(
     *, pages=None, dry_run=False, output_dir=".", no_enrich=False,
     wait_fn=_default_wait,   # Chirp/Kobo/Nook only — Kindle has no wait_fn param
+    cancel_fn=lambda: False,  # all four — checked between pages/books/retries (GUI-BACKEND-4a)
 ) -> RunResult: ...
 
 def main() -> None:
@@ -747,28 +764,39 @@ library, not a case where asyncio would've been the natural fit.
 completed/failed/cancelled`. `webapp/jobs/registry.py`'s `Job` dataclass holds
 `log_queue`, `continue_event`, `cancel_event`, `thread`, `result` (the whole
 `RunResult`/`ReconcileRunResult` object a scraper's `run()` returned — not a
-separately-extracted `result_paths` dict, see below), and `error`.
+separately-extracted `result_paths` dict, see below), `error`, and
+`output_dir` (resolved to an absolute path by `scrape_job_start()`, skipped
+for dry runs — lets the GUI tell the user exactly where files landed instead
+of only offering a Download button).
 `JobRegistry` enforces **one active job per provider** — not just for UI
 clarity, running two concurrent sessions against a CAPTCHA-sensitive site
 (Kobo/Chirp/Nook) from the same browser profile is a real way to get flagged.
 
-**The `wait_fn` injection pattern** (built on Rec-4a's scraper refactor):
-`webapp/jobs/runner.py`'s `_make_wait_fn(job)` builds a function that flips
-the job to `waiting_for_login` and polls `job.continue_event` (set by a
-`POST .../continue`, checked every 0.2s against `job.cancel_event` too) until
-it fires. `_build_run_callable()` in `webapp/app.py` uses
-`inspect.signature(module.run)` to detect whether the target scraper's `run()`
-accepts a `wait_fn` param at all (Kindle's doesn't — automated login) rather
-than hardcoding per-provider branches.
+**The `wait_fn`/`cancel_fn` injection pattern** (built on Rec-4a's scraper
+refactor): `webapp/jobs/runner.py`'s `_make_wait_fn(job)` builds a function
+that flips the job to `waiting_for_login` and polls `job.continue_event` (set
+by a `POST .../continue`, checked every 0.2s against `job.cancel_event` too)
+until it fires; `_make_cancel_fn(job)` just returns `job.cancel_event.is_set`.
+`start_job()`'s `run_callable` signature is `(wait_fn, cancel_fn)`.
+`_build_run_callable()` in `webapp/app.py` uses `inspect.signature(module.run)`
+to detect whether the target scraper's `run()` accepts a `wait_fn`/`cancel_fn`
+param at all (Kindle's `run()` has no `wait_fn` — automated login) rather than
+hardcoding per-provider branches — this also means a future fifth scraper
+without `cancel_fn` wouldn't break.
 
-**Cancellation is Tier 1 only, deliberately.** Setting `cancel_event` only
-takes effect while a job is in (or later enters) the login-wait poll loop. A
-job actively mid-scrape (a live Selenium call in flight) can't observe it —
-that needs a driver reference plumbed out of each scraper's `scrape_*()`,
-which doesn't exist and would mean touching all four scraper modules again.
-Tracked as follow-up `GUI-BACKEND-4a` in `docs/backlog.md`, not built. The
-FastAPI shutdown hook (a `lifespan` context manager, not the deprecated
-`@app.on_event`) has the same Tier-1-only scope.
+**Cancellation is cooperative, not a hard interrupt (`GUI-BACKEND-4a`,
+2026-07-23).** `job.cancel_event` is observed in two places: the login-wait
+poll loop (`_make_wait_fn`), and — since `GUI-BACKEND-4a` — a
+`_make_cancel_fn(job)` checker threaded through every scraper's `run()` as
+`cancel_fn: Callable[[], bool]`, checked between scrape pages, between each
+book's ISBN lookup/enrichment call, and between individual HTTP retry
+attempts inside `lib/http_retry.py`'s `request_json()`. Raises the shared
+`lib.cancellation.OperationCancelled`, caught in `runner.py`'s `_run()`. This
+still doesn't interrupt a **live Selenium call already in flight** — that
+needs a driver reference plumbed out of each scraper's `scrape_*()`, tracked
+as the still-deferred Tier-2 "force stop" follow-up in `docs/backlog.md`. The
+FastAPI shutdown hook (a `lifespan` context manager) and the `POST /shutdown`
+route both set `cancel_event` the same way, so they share this scope too.
 
 **Log bridge:** one `JobLogHandler` installed on the **root logger** at
 `webapp/app.py` import time. `register_thread(job)`/`unregister_thread()`
@@ -780,6 +808,21 @@ future tests: because the handler is on the *root* logger, any test logger
 with default propagation enabled will get double-delivered into a job's queue
 if that thread happens to be registered — set `logger.propagate = False` in
 tests that create their own `JobLogHandler` (see `tests/test_log_bridge.py`).
+
+**A real bug found here (2026-07-23), worth remembering:** `install()` must
+call `root.setLevel(logging.INFO)` itself, not just `addHandler()`. Each
+scraper module's own `logging.basicConfig(level=logging.INFO, ...)` (its
+CLI-path setup) is a complete no-op once the root logger already has a
+handler attached — Python's `basicConfig()` skips everything it does,
+including setting the level, whenever `root.handlers` is non-empty (unless
+`force=True`). Since `install()` runs at webapp startup, before any scraper
+module is ever imported, every scraper's `basicConfig()` call became a
+no-op under the GUI and the root logger silently stayed at Python's
+`WARNING` default — every `log.info(...)` progress line (all per-page/
+per-book output) was dropped before it ever reached the handler, with zero
+error or indication why. Only warnings/errors ever showed up in the GUI's
+log panel until this was fixed. The CLI path never hit this, since there a
+scraper's own `basicConfig()` is the first thing to touch the root logger.
 
 **SSE, not WebSocket:** the browser only needs one-directional push (log
 lines + status changes); Continue/Cancel are independent, infrequent, and map
@@ -796,12 +839,14 @@ no router-splitting yet, revisit if it gets unwieldy):
 | Route | Purpose |
 |---|---|
 | `GET /` | Dashboard — tool cards + live status badges (`_latest_status_per_provider()`) |
+| `GET /api/jobs-live` | Whether any job is queued/waiting/running — backs the Quit button's confirm dialog |
+| `POST /shutdown` | Cancels any live jobs, then `os._exit(0)` after a short delay so the response reaches the browser first |
 | `GET /scrape/{provider}` | Run-a-scraper page; 404 for unknown/disabled (Google) |
 | `POST /scrape/{provider}/jobs` | Start a job (`ScrapeOptions` body); 404 unknown provider, 409 already running |
 | `GET /scrape/{provider}/jobs/{id}/events` | SSE log/status stream |
-| `GET /scrape/{provider}/jobs/{id}` | JSON job detail: status, error, download links |
+| `GET /scrape/{provider}/jobs/{id}` | JSON job detail: status, error, `output_dir`, download links |
 | `POST /scrape/{provider}/jobs/{id}/continue` | Unblocks the login wait; 409 if not `waiting_for_login` |
-| `POST /scrape/{provider}/jobs/{id}/cancel` | Tier-1 cancel; 409 if already terminal |
+| `POST /scrape/{provider}/jobs/{id}/cancel` | Cooperative cancel (login wait, and — since `GUI-BACKEND-4a` — between scrape pages/books/retries); 409 if already terminal |
 | `GET /downloads/{job_id}/{filename}` | Serves a file — **only** if `filename` matches one of the job's own known result paths by basename; never joins user input onto a directory |
 
 **Security implemented so far:** `127.0.0.1`-only binding; downloads matched
@@ -809,7 +854,10 @@ by basename against the job's own result object, never a raw path join from
 `filename` (`_extract_result_paths()` pulls string fields off the
 `RunResult`/`ReconcileRunResult` dataclass generically). **Not yet done:**
 Origin/Referer CSRF check on state-changing routes, full path-traversal test
-sweep, credential-handling review — all `GUI-Security-1`, not started.
+sweep, credential-handling review — all `GUI-Security-1`, not started. Note
+`POST /shutdown` is a state-changing route with the same gap as every other
+POST route today — worth prioritizing in `GUI-Security-1` given its blast
+radius (kills the whole server) is bigger than `/cancel`'s.
 
 **Testing gotcha worth remembering:** `@patch("webapp.app._SCRAPER_MODULES",
 ...)` combined with `@patch("webapp.app.importlib.import_module")` in the same
@@ -821,11 +869,13 @@ regardless of which real module name string gets looked up.
 **Not automated-tested:** `webapp/static/app.js`. No JS test runner exists in
 this Python-only test stack, and adding one (Node/Jest) for ~130 lines of
 vanilla JS would be disproportionate. The Python side it depends on (page
-route, job-detail endpoint, SSE status events) has full coverage. **Click
-through `/scrape/<provider>` in a real browser at least once** before
-trusting the JS wiring — form submit → SSE → Continue button was never
-exercised end-to-end, since that needs a real scrape job (Selenium + a real
-login).
+route, job-detail endpoint, SSE status events) has full coverage.
+**Manually verified end-to-end, 2026-07-23:** the user ran all four scrapers
+for real through the GUI (real manual logins, real Continue clicks, real SSE
+log streaming) across several rounds of live bug reports — this is what
+surfaced the quit button, the login-wait popup bug, the Google Books
+rate-limiting chain, the Kindle credentials hang, and the root-logger level
+bug documented above. No longer an open action item.
 
 ---
 
@@ -857,8 +907,10 @@ login).
 | GUI-Backend-5 | 2026-07-22 | Scraper dispatch (`POST /scrape/{provider}/jobs`, signature-aware `wait_fn` injection) + safe downloads (basename-matched against the job's own result, never a raw path join); found a `mock.patch` interaction bug (patching `_SCRAPER_MODULES` + `importlib.import_module` together silently breaks the first patch) |
 | GUI-Frontend-1 | 2026-07-22 | Full `style.css` design system (tokens, dark mode, `.card`/`.btn`/`.badge`/`.log-panel`/forms) + `base.html` layout |
 | GUI-Frontend-2 | 2026-07-22 | Dashboard status badges (`_latest_status_per_provider()` — caught and fixed a real `datetime.now()` timestamp-tie bug via `>=` instead of `>`). Reconcile card still deferred to `GUI-Reconcile-1`. |
-| GUI-Frontend-3 | 2026-07-22 | Run-a-scraper page (`scrape.html` + `app.js`) — form, live log via SSE, login-wait UI, download links. Added `event: status` SSE events and a job-detail JSON endpoint beyond the original ticket scope, since the original design (only a final `done` event) couldn't support a live Continue button. **`app.js` itself is unverified in a real browser — action item.** |
-| Rec-5 | TBD | Integration run against real data; polish (needs a human present) |
+| GUI-Frontend-3 | 2026-07-22 | Run-a-scraper page (`scrape.html` + `app.js`) — form, live log via SSE, login-wait UI, download links. Added `event: status` SSE events and a job-detail JSON endpoint beyond the original ticket scope, since the original design (only a final `done` event) couldn't support a live Continue button. `app.js` itself unverified in a real browser at the time — closed out in the GUI-live-testing session below. |
+| GUI-Backend-4a | 2026-07-23 | Cooperative cancel (checked between scrape pages/books/HTTP retries, not just login-wait) across all four scrapers; `lib/http_retry.py` (centralized retry helper, real 429/`Retry-After` handling — found via manual testing that Google Books' 429s weren't being backed off long enough); `POST /shutdown` + `GET /api/jobs-live` + a Quit button; fixed a real UX bug where the login-wait Continue button looked unresponsive for ~1s; `Job.output_dir` + a "Files saved to" note alongside the download buttons |
+| GUI-live-testing | 2026-07-23 | First real end-to-end browser testing of `app.js`/all four scrapers, driven entirely by live user bug reports rather than a written test plan. Chain of enrichment-reliability fixes, each one prompted by the previous fix not being enough: wider jitter → didn't help (Google's anonymous quota doesn't clear in seconds) → circuit breaker (skip Google Books for a cooldown after one 429 instead of re-discovering the same block every book) → optional `GOOGLE_BOOKS_API_KEY` (the actual root-cause fix — bigger separate quota) → discovered and fixed `AI_PROVIDER` case-sensitivity and a total absence of AI-fallback success logging. Then a `.env`/webdriver_manager credentials hang (Kindle blocking the whole server on a stdin prompt the browser can't answer) → `credentials_from_env()` non-interactive variant. Then, after adding per-book progress logging still didn't produce visible output, traced it to the session's most significant find: **the root logger's level was silently stuck at WARNING under the GUI the entire time** (each scraper's `logging.basicConfig(level=logging.INFO, ...)` no-ops once the root logger already has a handler — which `log_bridge.install()` always attaches first, at webapp startup) — every `log.info(...)` progress line, across every prior GUI session, had been silently dropped; fixed with one `root.setLevel(logging.INFO)` line, confirmed by reproducing the broken behavior standalone before shipping the fix. Also: `[hidden]` CSS bug (a `.card { display: flex }` rule beat the browser's default `[hidden] { display: none }` regardless of specificity, so the login-wait card never actually hid), Cancel-button/status-row layout fixes, and a `.env` + `GOOGLE_BOOKS_API_KEY`/`credentials_from_env` setup walkthrough. |
+| Rec-5 | Next up | Integration run against real data. **Not yet done — this is the very next step.** User is about to run a full scrape of their real collection across all four providers (validated working end-to-end as of the session above) specifically to generate the real scrape CSVs this needs; also grab a fresh Libib export first (the committed reference file is from 2026-06-09, stale). Then `python -m libib_reconcile --libib <fresh-export.csv> --chirp ... --kindle ... --kobo ... --nook ...` (or `--scrape` if driving scrapers directly from the reconciler CLI) against the real data — matching quality/fuzzy-threshold tuning can't be meaningfully validated on small samples. |
 | GUI-Reconcile-1..3 | TBD | Libib CSV upload, reconcile job wiring, results page |
 | GUI-Settings-1 / GUI-Security-1 / GUI-Polish-1 | TBD | Settings page, CSRF/path-traversal hardening, docs |
 

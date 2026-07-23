@@ -28,6 +28,7 @@ All four tools share a common `lib/` layer for ISBN resolution, deduplication, f
 - [Options](#options)
 - [Metadata Enrichment](#metadata-enrichment)
 - [AI Provider Fallback (optional)](#ai-provider-fallback-optional)
+- [Google Books API Key (optional)](#google-books-api-key-optional)
 - [Output Files](#output-files)
 - [Importing into Libib](#importing-into-libib)
 - [Configuration](#configuration)
@@ -173,6 +174,12 @@ set KINDLE_EMAIL=you@example.com
 set KINDLE_PASSWORD=yourpassword
 ```
 
+**Using the web GUI?** Set these in `.env` instead (see [AI Provider Fallback](#ai-provider-fallback-optional)
+above for how `.env` loading works). The GUI never falls back to an
+interactive terminal prompt — a web page has no terminal to answer it — so if
+`KINDLE_EMAIL`/`KINDLE_PASSWORD` aren't set, the job fails immediately with a
+copy-pasteable `.env` snippet in the error instead of hanging.
+
 ## Kobo
 
 Kobo uses hCaptcha on its sign-in page (`authorize.kobo.com`) which fingerprints Selenium-opened tabs and blocks automated login. **No credentials are required** — the script uses a manual two-tab workaround. See [Kobo — hCaptcha workaround](#kobo--hcaptcha-workaround) below for the full explanation.
@@ -314,9 +321,42 @@ export AI_PROVIDER=openai
 export OPENAI_API_KEY=sk-...
 ```
 
+**Using the web GUI (`python -m webapp`)?** Copy `.env.example` to `.env` in the
+repo root and fill in the values instead — it's loaded automatically at
+startup and gitignored, so your key never gets committed. Running a scraper
+directly from the CLI does not read `.env`; use real environment variables
+for that.
+
 If `AI_PROVIDER` is unset, this stage is skipped entirely — no API calls, no
 errors. Currently `openai` is the only supported provider; the interface is
 provider-agnostic so others can be added later without changing call sites.
+
+---
+
+# Google Books API Key (optional)
+
+The Google Books lookup during enrichment normally uses Google's public,
+anonymous endpoint, which has a small quota — long runs can hit `429 Too Many
+Requests` and stay rate-limited for a while once tripped (the enricher backs
+off and, if it keeps happening, temporarily stops calling Google Books
+entirely rather than retrying every book). An API key gets a separate, much
+larger quota and avoids this.
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com), create a
+   project, then **APIs & Services → Library** and enable **Books API**.
+2. **APIs & Services → Credentials → Create Credentials → API key**.
+3. Restrict it: **API restrictions → Restrict key → Books API**.
+   **Application restrictions: None** — this key is used by a server-side
+   script, not a browser page or mobile app, so the "Websites"/"Android"/"iOS"
+   options don't apply and would just break it.
+4. Set it via `.env` (see above) or an environment variable:
+
+```bash
+export GOOGLE_BOOKS_API_KEY=AIza...
+```
+
+Leave it unset to keep using the anonymous endpoint — everything still works,
+just with a smaller quota.
 
 ---
 
@@ -394,6 +434,7 @@ Library lookup, only falling back to Open Library for the rare book missing one.
 |-----------------------|---------|-------------|
 | `AI_PROVIDER` | unset | Enables the [AI fallback](#ai-provider-fallback-optional) when set (e.g. `openai`) |
 | `OPENAI_API_KEY` | unset | API key for the `openai` provider |
+| `GOOGLE_BOOKS_API_KEY` | unset | Optional [Google Books API key](#google-books-api-key-optional) — larger quota than the anonymous endpoint |
 
 ### `chirp_to_libib/core.py`
 
