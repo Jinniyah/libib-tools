@@ -23,7 +23,7 @@ def _wait_for(predicate, timeout=2.0, interval=0.02):
 def test_job_completes_after_manual_login_wait():
     registry = JobRegistry()
 
-    def fake_run(wait_fn):
+    def fake_run(wait_fn, cancel_fn):
         wait_fn()
         return "done"
 
@@ -42,7 +42,7 @@ def test_job_completes_without_login_step():
     """Providers with no manual login (Kindle) never call wait_fn at all."""
     registry = JobRegistry()
 
-    def fake_run(wait_fn):
+    def fake_run(wait_fn, cancel_fn):
         return "done-no-login"
 
     job = start_job(registry, "fake-kindle-like", fake_run)
@@ -55,7 +55,7 @@ def test_job_completes_without_login_step():
 def test_job_fails_on_exception():
     registry = JobRegistry()
 
-    def fake_run(wait_fn):
+    def fake_run(wait_fn, cancel_fn):
         raise RuntimeError("boom")
 
     job = start_job(registry, "fake", fake_run)
@@ -68,7 +68,7 @@ def test_job_fails_on_exception():
 def test_job_cancelled_during_login_wait():
     registry = JobRegistry()
 
-    def fake_run(wait_fn):
+    def fake_run(wait_fn, cancel_fn):
         wait_fn()
         return "should never get here"
 
@@ -90,7 +90,7 @@ def test_job_cancelled_during_login_wait():
 def test_registry_blocks_second_job_for_same_provider_while_active():
     registry = JobRegistry()
 
-    def fake_run(wait_fn):
+    def fake_run(wait_fn, cancel_fn):
         wait_fn()
         return "done"
 
@@ -108,7 +108,7 @@ def test_registry_blocks_second_job_for_same_provider_while_active():
 def test_registry_allows_new_job_after_previous_completes():
     registry = JobRegistry()
 
-    def fake_run(wait_fn):
+    def fake_run(wait_fn, cancel_fn):
         return "done"
 
     job1 = start_job(registry, "fake", fake_run)
@@ -122,7 +122,7 @@ def test_registry_allows_new_job_after_previous_completes():
 def test_registry_allows_concurrent_jobs_for_different_providers():
     registry = JobRegistry()
 
-    def fake_run(wait_fn):
+    def fake_run(wait_fn, cancel_fn):
         wait_fn()
         return "done"
 

@@ -7,13 +7,16 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 import queue as queue_module
+import threading
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,6 +26,17 @@ from pydantic import BaseModel
 from webapp.jobs.log_bridge import install as install_log_bridge
 from webapp.jobs.registry import Job, JobAlreadyRunningError, JobRegistry
 from webapp.jobs.runner import start_job
+
+# Loads a `.env` file (KINDLE_EMAIL/PASSWORD, AI_PROVIDER, OPENAI_API_KEY) from
+# the current or a parent directory, if one exists — a silent no-op otherwise.
+# Never overrides a real environment variable already set (load_dotenv's
+# default). Module-level so it also covers `uvicorn webapp.app:app` directly,
+# not just `python -m webapp`.
+load_dotenv()
+
+# Delay before the process actually exits after /shutdown responds, so the
+# HTTP response reaches the browser first.
+_SHUTDOWN_DELAY_SECONDS = 0.3
 
 _BASE_DIR = Path(__file__).resolve().parent
 _TEMPLATES_DIR = _BASE_DIR / "templates"
@@ -124,14 +138,28 @@ TOOL_CARDS: list[ToolCard] = [
 
 
 def _build_run_callable(module: Any, options: ScrapeOptions) -> Any:
-    """Build the run_callable start_job() expects: a function of (wait_fn)
-    that calls the scraper's own run(). Kindle's run() has no wait_fn
-    parameter (automated login) — inspecting the signature, rather than
-    hardcoding per-provider, keeps this generic across all four scrapers.
-    """
-    accepts_wait_fn = "wait_fn" in inspect.signature(module.run).parameters
+    """Build the run_callable start_job() expects: a function of (wait_fn,
+    cancel_fn) that calls the scraper's own run(). Kindle's run() has no
+    wait_fn parameter (automated login) — inspecting the signature, rather
+    than hardcoding per-provider, keeps this generic across all four
+    scrapers (and any future one that likewise omits wait_fn/cancel_fn).
 
-    def run_callable(wait_fn: Any) -> Any:
+    Kindle's run() also accepts credentials_fn — swapped to the module's own
+    credentials_from_env() when present, instead of the CLI default
+    (_prompt_credentials) which blocks on stdin. A web page has no terminal to
+    answer an input() prompt, so the CLI default would hang the whole server
+    with no way to cancel; credentials_from_env() raises immediately instead,
+    with a copy-pasteable .env snippet in the error.
+    """
+    run_params = inspect.signature(module.run).parameters
+    accepts_wait_fn = "wait_fn" in run_params
+    accepts_cancel_fn = "cancel_fn" in run_params
+    credentials_from_env = getattr(module, "credentials_from_env", None)
+    accepts_credentials_fn = (
+        "credentials_fn" in run_params and credentials_from_env is not None
+    )
+
+    def run_callable(wait_fn: Any, cancel_fn: Any) -> Any:
         kwargs: dict[str, Any] = {
             "pages": options.pages,
             "dry_run": options.dry_run,
@@ -140,6 +168,10 @@ def _build_run_callable(module: Any, options: ScrapeOptions) -> Any:
         }
         if accepts_wait_fn:
             kwargs["wait_fn"] = wait_fn
+        if accepts_cancel_fn:
+            kwargs["cancel_fn"] = cancel_fn
+        if accepts_credentials_fn:
+            kwargs["credentials_fn"] = credentials_from_env
         return module.run(**kwargs)
 
     return run_callable
@@ -179,16 +211,17 @@ def _get_job_or_404(provider: str, job_id: str) -> Job:
     return job
 
 
+def _any_job_live() -> bool:
+    return any(job.status not in _TERMINAL_STATUSES for job in registry.all())
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
-    # Shutdown: cancel any jobs still in flight. This only interrupts jobs
-    # currently blocked in the login-wait poll loop (Tier 1 — see
-    # webapp/jobs/runner.py) — a job actively mid-scrape (a live Selenium
-    # call in progress) has no way to observe cancel_event today. Force-
-    # killing that requires plumbing a driver reference through each
-    # scraper's run(), deliberately deferred as Tier 2 (not MVP) — see
-    # docs/backlog.md, "Web GUI (webapp)" > Architecture summary.
+    # Shutdown (Ctrl-C, or the process exiting normally): cancel any jobs
+    # still in flight, same cooperative cancel_event the /cancel route and
+    # /shutdown route use — see webapp/jobs/runner.py and each scraper
+    # core's cancel_fn checks between pages/books/retries.
     for job in registry.all():
         if job.status not in _TERMINAL_STATUSES:
             job.cancel_event.set()
@@ -232,6 +265,27 @@ def create_app() -> FastAPI:
             {"tools": TOOL_CARDS, "statuses": _latest_status_per_provider()},
         )
 
+    @app.get("/api/jobs-live")
+    def jobs_live() -> dict[str, bool]:
+        """Backs the Quit button's confirm dialog — whether any job is
+        currently queued/waiting/running, so it only warns when true."""
+        return {"jobs_running": _any_job_live()}
+
+    @app.post("/shutdown")
+    def shutdown() -> dict[str, Any]:
+        """Cancel any in-flight jobs, then force-exit the process shortly
+        after this response is sent (long enough for the browser to receive
+        it, not long enough to matter). A job actively mid-scrape (a live
+        Selenium call in progress) may not unwind cleanly — same known
+        limitation as /cancel; the client warns first if jobs_running."""
+        jobs_running = _any_job_live()
+        for job in registry.all():
+            if job.status not in _TERMINAL_STATUSES:
+                job.cancel_event.set()
+
+        threading.Timer(_SHUTDOWN_DELAY_SECONDS, os._exit, args=(0,)).start()
+        return {"ok": True, "jobs_running": jobs_running}
+
     @app.get("/scrape/{provider}")
     def scrape_page(request: Request, provider: str) -> HTMLResponse:
         tool = next((t for t in TOOL_CARDS if t.slug == provider), None)
@@ -254,6 +308,7 @@ def create_app() -> FastAPI:
             "job_id": job.id,
             "status": job.status,
             "error": job.error,
+            "output_dir": job.output_dir,
             "downloads": [
                 {"filename": Path(p).name, "url": f"/downloads/{job.id}/{Path(p).name}"}
                 for p in _extract_result_paths(job.result)
@@ -278,10 +333,9 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=409, detail=f"Job already finished (status: {job.status})."
             )
-        # Tier 1 only — see _lifespan's docstring-equivalent comment above.
-        # Setting cancel_event only takes effect if/when the job is (or
-        # later enters) the login-wait poll loop; it has no effect on a
-        # job actively mid-scrape.
+        # Observed at the login-wait poll and between scrape pages/books/
+        # retries (see each scraper core's cancel_fn checks) — cooperative,
+        # so it doesn't interrupt a single Selenium call already in flight.
         job.cancel_event.set()
         return {"ok": True}
 
@@ -301,6 +355,11 @@ def create_app() -> FastAPI:
             job = start_job(registry, provider, run_callable)
         except JobAlreadyRunningError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        # Resolved to an absolute path so the GUI can tell the user exactly
+        # where files landed — skipped for dry runs, which write nothing.
+        if not options.dry_run:
+            job.output_dir = str(Path(options.output_dir).resolve())
 
         return {"job_id": job.id, "status": job.status}
 

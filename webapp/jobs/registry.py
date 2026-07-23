@@ -34,6 +34,7 @@ class Job:
     thread: Optional[threading.Thread] = None
     result: Any = None
     error: Optional[str] = None
+    output_dir: Optional[str] = None
 
 
 class JobRegistry:

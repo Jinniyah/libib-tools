@@ -9,6 +9,7 @@
 <body>
   <header class="site-header">
     <a href="/"><strong>LibibTools</strong></a>
+    <button type="button" class="btn btn-danger" id="quit-btn">Quit</button>
   </header>
   <main>
     {% block content %}{% endblock %}
@@ -16,5 +17,27 @@
   <footer class="site-footer">
     <p>Runs locally at <code>127.0.0.1</code> — nothing here talks to the outside world except the providers you scrape and (if enabled) the AI metadata fallback.</p>
   </footer>
+  <script>
+    document.getElementById("quit-btn").addEventListener("click", async () => {
+      let jobsRunning = false;
+      try {
+        const statusResp = await fetch("/api/jobs-live");
+        jobsRunning = (await statusResp.json()).jobs_running;
+      } catch (err) {
+        // If the check itself fails, fall through and let /shutdown decide.
+      }
+
+      if (jobsRunning && !confirm(
+        "A job is still running. Quitting now may leave a browser window " +
+        "open and interrupt the run. Quit anyway?"
+      )) {
+        return;
+      }
+
+      await fetch("/shutdown", { method: "POST" }).catch(() => {});
+      document.body.innerHTML =
+        "<p style='padding: 2rem;'>Server is shutting down — it's safe to close this tab.</p>";
+    });
+  </script>
 </body>
 </html>

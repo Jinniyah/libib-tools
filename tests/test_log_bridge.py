@@ -1,7 +1,12 @@
 import logging
 import threading
 
-from webapp.jobs.log_bridge import JobLogHandler, register_thread, unregister_thread
+from webapp.jobs.log_bridge import (
+    JobLogHandler,
+    install,
+    register_thread,
+    unregister_thread,
+)
 from webapp.jobs.registry import JobRegistry
 
 
@@ -85,3 +90,23 @@ def test_thread_isolation_job_a_logs_never_leak_into_job_b():
 def test_unregister_is_safe_when_never_registered():
     # Must not raise even if called on a thread that never registered.
     unregister_thread()
+
+
+def test_install_sets_root_level_so_scraper_info_logs_are_not_dropped():
+    """Regression test for a real bug: each scraper module's own
+    logging.basicConfig(level=logging.INFO, ...) call (its CLI-path setup)
+    silently no-ops once the root logger already has a handler attached —
+    Python's basicConfig() skips everything, including setting the level,
+    whenever root.handlers is non-empty (unless force=True). Since install()
+    runs at webapp startup, before any scraper module is ever imported,
+    every scraper's basicConfig() call became a no-op under the GUI, leaving
+    the root logger at Python's WARNING default — every log.info(...) call
+    (all per-page/per-book progress output) was silently dropped before it
+    ever reached a handler. install() must set the level itself so a logger
+    that never configures its own level (matching every scraper's actual
+    logger) still has INFO enabled via inheritance.
+    """
+    install()
+
+    log = logging.getLogger("test_log_bridge.never_configured_by_this_test")
+    assert log.isEnabledFor(logging.INFO)

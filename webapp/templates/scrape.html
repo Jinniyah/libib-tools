@@ -33,12 +33,14 @@
 </form>
 
 <section id="job-panel" hidden>
-  <h2>Status: <span id="job-status" class="badge">queued</span></h2>
+  <div class="status-row">
+    <h2>Status: <span id="job-status" class="badge">queued</span></h2>
+    <button type="button" class="btn btn-danger" id="cancel-btn">Cancel</button>
+  </div>
 
   <div id="login-wait" hidden class="card">
     <p>A browser window has opened for manual login. Log in there, then come back and click Continue.</p>
     <button type="button" class="btn" id="continue-btn">Continue</button>
-    <button type="button" class="btn btn-danger" id="cancel-btn">Cancel</button>
   </div>
 
   <div class="log-panel" id="log-panel"></div>

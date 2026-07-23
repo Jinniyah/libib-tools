@@ -14,6 +14,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from lib.cancellation import OperationCancelled
 from webapp.jobs.log_bridge import register_thread, unregister_thread
 from webapp.jobs.registry import Job, JobRegistry
 
@@ -21,10 +22,6 @@ log = logging.getLogger(__name__)
 
 # How often the login-wait loop wakes up to check for cancellation.
 _WAIT_POLL_INTERVAL = 0.2
-
-
-class JobCancelled(Exception):
-    """Raised internally to unwind out of a cancelled job's wait_fn."""
 
 
 def _make_wait_fn(job: Job) -> Callable[[], None]:
@@ -39,22 +36,32 @@ def _make_wait_fn(job: Job) -> Callable[[], None]:
         job.status = "waiting_for_login"
         while not job.continue_event.wait(timeout=_WAIT_POLL_INTERVAL):
             if job.cancel_event.is_set():
-                raise JobCancelled()
+                raise OperationCancelled()
         job.continue_event.clear()
         job.status = "running"
 
     return wait_fn
 
 
-def _run(job: Job, run_callable: Callable[[Callable[[], None]], Any]) -> None:
+def _make_cancel_fn(job: Job) -> Callable[[], bool]:
+    """Build the cancel_fn a scraper's run() polls between pages/books/retries
+    once past the login step (see lib.cancellation.OperationCancelled)."""
+    return job.cancel_event.is_set
+
+
+def _run(
+    job: Job,
+    run_callable: Callable[[Callable[[], None], Callable[[], bool]], Any],
+) -> None:
     register_thread(job)
     try:
         job.status = "running"
         wait_fn = _make_wait_fn(job)
+        cancel_fn = _make_cancel_fn(job)
         try:
-            job.result = run_callable(wait_fn)
+            job.result = run_callable(wait_fn, cancel_fn)
             job.status = "completed"
-        except JobCancelled:
+        except OperationCancelled:
             job.status = "cancelled"
             log.info("Job %s (%s) cancelled.", job.id, job.provider)
         except Exception as exc:
@@ -68,14 +75,15 @@ def _run(job: Job, run_callable: Callable[[Callable[[], None]], Any]) -> None:
 def start_job(
     registry: JobRegistry,
     provider: str,
-    run_callable: Callable[[Callable[[], None]], Any],
+    run_callable: Callable[[Callable[[], None], Callable[[], bool]], Any],
 ) -> Job:
     """Create and start a job.
 
-    `run_callable` receives the job's wait_fn and should pass it through to
-    wherever a scraper's run() expects one — e.g.
-    `lambda wait_fn: chirp_to_libib.core.run(wait_fn=wait_fn, ...)`. Providers
-    with no manual-login step (Kindle) can just ignore the argument.
+    `run_callable` receives the job's wait_fn and cancel_fn and should pass
+    them through to wherever a scraper's run() expects them — e.g.
+    `lambda wait_fn, cancel_fn: chirp_to_libib.core.run(wait_fn=wait_fn,
+    cancel_fn=cancel_fn, ...)`. Providers with no manual-login step (Kindle)
+    can just ignore wait_fn.
     """
     job = registry.create(provider)
     thread = threading.Thread(target=_run, args=(job, run_callable), daemon=True)

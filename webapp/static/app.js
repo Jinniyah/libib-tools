@@ -22,12 +22,15 @@ function initScrapePage() {
   const resultSummary = document.getElementById("job-result-summary");
   const downloadsBox = document.getElementById("job-downloads");
 
+  const TERMINAL_STATUSES = ["completed", "failed", "cancelled"];
+
   let currentJobId = null;
 
   function setStatus(status) {
     statusBadge.textContent = status;
     statusBadge.className = "badge badge-status-" + status;
     loginWait.hidden = status !== "waiting_for_login";
+    cancelBtn.hidden = TERMINAL_STATUSES.includes(status);
   }
 
   function appendLog(line) {
@@ -49,6 +52,9 @@ function initScrapePage() {
     } else if (detail.downloads.length === 0) {
       resultSummary.textContent =
         "Job " + detail.status + ". No files were written (dry run, or no books found).";
+    } else if (detail.output_dir) {
+      resultSummary.textContent =
+        "Job " + detail.status + ". Files saved to: " + detail.output_dir;
     } else {
       resultSummary.textContent = "Job " + detail.status + ".";
     }
@@ -99,6 +105,8 @@ function initScrapePage() {
     const data = await response.json();
     currentJobId = data.job_id;
     jobPanel.hidden = false;
+    cancelBtn.disabled = false;
+    continueBtn.disabled = false;
     setStatus(data.status);
 
     const source = new EventSource(jobUrl("/events"));
@@ -117,8 +125,20 @@ function initScrapePage() {
 
   continueBtn.addEventListener("click", async () => {
     continueBtn.disabled = true;
-    await fetch(jobUrl("/continue"), { method: "POST" });
-    continueBtn.disabled = false;
+    // Hide immediately rather than waiting for the status SSE event to come
+    // back — a successful Continue always moves the job off
+    // waiting_for_login, and waiting for that round trip (backend poll +
+    // SSE push) left the popup visible and re-clickable for up to ~1s,
+    // which read as "my click didn't register."
+    loginWait.hidden = true;
+
+    const response = await fetch(jobUrl("/continue"), { method: "POST" });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      appendLog("Error continuing job: " + (body.detail || response.statusText));
+      loginWait.hidden = false;
+      continueBtn.disabled = false;
+    }
   });
 
   cancelBtn.addEventListener("click", async () => {

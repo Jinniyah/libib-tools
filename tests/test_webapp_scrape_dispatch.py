@@ -56,6 +56,27 @@ def _fake_run_without_wait_fn(
     )
 
 
+def _fake_credentials_from_env():
+    raise ValueError("KINDLE_EMAIL and KINDLE_PASSWORD are not set.\nKINDLE_EMAIL=")
+
+
+def _fake_run_with_credentials_fn(
+    *,
+    pages=None,
+    dry_run=False,
+    output_dir=".",
+    no_enrich=False,
+    credentials_fn=None,
+):
+    credentials_fn()  # a real scraper's run() calls this itself; the fake mirrors that
+    return SimpleNamespace(
+        csv_path="/tmp/fake_kindle.csv",
+        unresolved_path=None,
+        total_books=0,
+        resolved_count=0,
+    )
+
+
 # ==========================
 # POST /scrape/{provider}/jobs
 # ==========================
@@ -97,6 +118,26 @@ def test_start_job_no_wait_fn_provider_does_not_receive_one(mock_import_module):
     job = registry.get(job_id)
     assert _wait_for(lambda: job.status == "completed")
     assert job.result.received_wait_fn is False
+
+
+@patch("webapp.app.importlib.import_module")
+def test_start_job_credentials_fn_provider_gets_env_only_variant(mock_import_module):
+    """A module exposing both a credentials_fn-accepting run() and a
+    credentials_from_env() (Kindle's shape) gets the non-interactive variant
+    wired in automatically — verifies _build_run_callable's detection, not
+    the real Kindle scraper (which would pull in Selenium/webdriver_manager)."""
+    mock_import_module.return_value = SimpleNamespace(
+        run=_fake_run_with_credentials_fn,
+        credentials_from_env=_fake_credentials_from_env,
+    )
+
+    response = client.post("/scrape/kindle/jobs", json={})
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    job = registry.get(job_id)
+    assert _wait_for(lambda: job.status == "failed")
+    assert "KINDLE_EMAIL=" in job.error
 
 
 @patch("webapp.app.importlib.import_module")

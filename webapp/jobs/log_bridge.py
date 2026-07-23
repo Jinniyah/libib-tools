@@ -45,8 +45,25 @@ class JobLogHandler(logging.Handler):
 
 
 def install() -> JobLogHandler:
-    """Attach the handler to the root logger. Call once at app startup."""
+    """Attach the handler to the root logger. Call once at app startup.
+
+    Also sets the root logger's level to INFO. This matters more than it
+    looks: each scraper module's own `logging.basicConfig(level=logging.INFO,
+    ...)` call (their CLI-path setup) silently does nothing once the root
+    logger already has a handler attached — Python's basicConfig() no-ops
+    entirely (including the level) whenever `root.handlers` is non-empty,
+    unless called with `force=True`. Since this handler is installed at
+    webapp startup, before any scraper module is ever imported, every
+    scraper's basicConfig() call becomes a no-op under the GUI, and the root
+    logger's level silently stays at the Python default of WARNING — every
+    log.info(...) call (all per-page/per-book progress output) gets dropped
+    before it ever reaches this handler, with no error or indication why.
+    Setting the level explicitly here is what makes that progress output
+    actually show up in the GUI's log panel.
+    """
     handler = JobLogHandler()
     handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATEFMT))
-    logging.getLogger().addHandler(handler)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
     return handler

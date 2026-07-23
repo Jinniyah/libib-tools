@@ -108,6 +108,16 @@
   box-sizing: border-box;
 }
 
+/* Author rules always beat the UA default `[hidden] { display: none }`
+   regardless of selector specificity (origin outranks specificity in the
+   cascade) — so any element that also matches a rule setting its own
+   `display` (e.g. `.card { display: flex }`) never actually hides when the
+   `hidden` attribute is set. This restores `hidden` as the reliable "make
+   this invisible" mechanism everywhere in the app. */
+[hidden] {
+  display: none !important;
+}
+
 html {
   color-scheme: light dark;
 }
@@ -137,8 +147,26 @@ h1, h2, h3 {
    ========================== */
 
 .site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   border-bottom: 1px solid var(--color-border);
   padding: var(--space-3) var(--space-4);
+}
+
+#job-panel {
+  margin-top: var(--space-3);
+}
+
+.status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-3);
+}
+
+.status-row h2 {
+  margin: 0;
 }
 
 .site-header a {
@@ -312,6 +340,12 @@ main {
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* A failed job's error message (e.g. missing-credentials instructions with a
+   copy-pasteable .env snippet) can carry its own newlines — preserve them. */
+#job-result-summary {
+  white-space: pre-line;
 }
 
 /* ==========================
