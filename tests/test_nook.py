@@ -1,7 +1,7 @@
 import csv
 import os
 import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from lib import EnrichmentResult, LIBIB_HEADERS
 
@@ -153,7 +153,9 @@ def test_resolve_isbns_falls_back_when_missing(mock_sleep, mock_get_isbn):
     books = [("Unknown Book", "Unknown Author", "", "cover")]
     result = resolve_isbns(books)
     assert result[0][2] == "9781402894626"
-    mock_get_isbn.assert_called_once_with("Unknown Book", "Unknown Author")
+    mock_get_isbn.assert_called_once_with(
+        "Unknown Book", "Unknown Author", cancel_fn=ANY
+    )
     mock_sleep.assert_called_once()
 
 
@@ -343,4 +345,4 @@ def test_run_passes_wait_fn_through_to_scrape(mock_scrape):
 
     run(wait_fn=my_wait)
 
-    mock_scrape.assert_called_once_with(max_pages=None, wait_fn=my_wait)
+    mock_scrape.assert_called_once_with(max_pages=None, wait_fn=my_wait, cancel_fn=ANY)

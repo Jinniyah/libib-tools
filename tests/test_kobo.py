@@ -1,7 +1,7 @@
 import csv
 import os
 import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from kobo_to_libib.core import (
     RunResult,
@@ -113,7 +113,7 @@ def test_resolve_isbns(mock_sleep, mock_isbn):
     books = [("Dune", "Frank Herbert", "cover")]
     result = resolve_isbns(books)
     assert result[0][2] == "9781402894626"
-    mock_isbn.assert_called_once_with("Dune", "Frank Herbert")
+    mock_isbn.assert_called_once_with("Dune", "Frank Herbert", cancel_fn=ANY)
 
 
 @patch("kobo_to_libib.core.get_isbn", return_value=None)
@@ -301,7 +301,7 @@ def test_run_passes_wait_fn_through_to_scrape(mock_scrape):
 
     run(wait_fn=my_wait)
 
-    mock_scrape.assert_called_once_with(max_pages=None, wait_fn=my_wait)
+    mock_scrape.assert_called_once_with(max_pages=None, wait_fn=my_wait, cancel_fn=ANY)
 
 
 def test_write_unresolved_returns_none_when_all_resolved():

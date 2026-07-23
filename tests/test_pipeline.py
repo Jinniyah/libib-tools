@@ -30,7 +30,9 @@ def test_pipeline_dry_run(
     # Credentials are no longer prompted for Chirp — login is manual via browser.
     # wait_fn is now threaded through from run()'s default; ANY sidesteps
     # coupling this assertion to the exact default function object.
-    mock_scrape.assert_called_once_with("", "", max_pages=None, wait_fn=ANY)
+    mock_scrape.assert_called_once_with(
+        "", "", max_pages=None, wait_fn=ANY, cancel_fn=ANY
+    )
     assert mock_get_isbn.call_count == 2
     assert mock_enrich_book.call_count == 2
     mock_write_csv.assert_not_called()
@@ -128,4 +130,6 @@ def test_run_passes_wait_fn_through_to_scrape(mock_scrape):
 
     run(wait_fn=my_wait)
 
-    mock_scrape.assert_called_once_with("", "", max_pages=None, wait_fn=my_wait)
+    mock_scrape.assert_called_once_with(
+        "", "", max_pages=None, wait_fn=my_wait, cancel_fn=ANY
+    )

@@ -31,7 +31,7 @@ def test_title_is_plausible():
     assert _title_is_plausible("Hobbit", "The Hobbit")
 
 
-@patch("lib.openlibrary.requests.get")
+@patch("lib.http_retry.requests.get")
 def test_ol_query_success(mock_get):
     mock_get.return_value.json.return_value = {"docs": [{"title": "Test"}]}
     mock_get.return_value.raise_for_status = lambda: None
@@ -39,7 +39,7 @@ def test_ol_query_success(mock_get):
     assert docs == [{"title": "Test"}]
 
 
-@patch("lib.openlibrary.requests.get")
+@patch("lib.http_retry.requests.get")
 def test_get_isbn_title_only(mock_get):
     mock_get.return_value.raise_for_status = lambda: None
     mock_get.return_value.json.return_value = {

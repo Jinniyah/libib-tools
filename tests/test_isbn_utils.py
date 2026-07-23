@@ -25,7 +25,7 @@ def test_best_isbn():
     assert _best_isbn(["0321146530"]) == "0321146530"
 
 
-@patch("lib.openlibrary.requests.get")
+@patch("lib.http_retry.requests.get")
 def test_get_isbn_title_only(mock_get):
     mock_get.return_value.raise_for_status = lambda: None
     mock_get.return_value.json.return_value = {

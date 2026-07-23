@@ -5,10 +5,11 @@ import logging
 import random
 import re
 import time
+from collections.abc import Callable
 from difflib import SequenceMatcher
 from typing import Optional
 
-import requests
+from lib.http_retry import request_json
 
 log = logging.getLogger(__name__)
 
@@ -155,32 +156,20 @@ def _title_is_plausible(
 # -----------------------------
 
 
-def _ol_query(params: dict, title_for_log: str) -> list[dict]:
+def _ol_query(
+    params: dict,
+    title_for_log: str,
+    cancel_fn: Optional[Callable[[], bool]] = None,
+) -> list[dict]:
     """Execute one Open Library search with retries and exponential backoff."""
-    max_retries = 4
-    backoff = 2
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = requests.get(
-                _OL_URL,
-                params={**_OL_BASE_PARAMS, **params},
-                timeout=20,
-            )
-            resp.raise_for_status()
-            return resp.json().get("docs", [])
-        except Exception as exc:
-            log.warning(
-                "Open Library error for '%s' (attempt %d/%d): %s",
-                title_for_log,
-                attempt,
-                max_retries,
-                exc,
-            )
-            time.sleep(backoff)
-            backoff *= 2
-
-    return []
+    data = request_json(
+        _OL_URL,
+        title_for_log,
+        params={**_OL_BASE_PARAMS, **params},
+        max_retries=4,
+        cancel_fn=cancel_fn,
+    )
+    return (data or {}).get("docs", [])
 
 
 # -----------------------------
@@ -211,7 +200,9 @@ def _pick_isbn_from_docs(docs: list[dict], title: str) -> Optional[str]:
 # -----------------------------
 
 
-def get_isbn(title: str, author: str) -> Optional[str]:
+def get_isbn(
+    title: str, author: str, cancel_fn: Optional[Callable[[], bool]] = None
+) -> Optional[str]:
     """
     Look up an ISBN via Open Library using:
     1. title + author
@@ -219,13 +210,13 @@ def get_isbn(title: str, author: str) -> Optional[str]:
     """
     # Pass 1: title + author
     if author:
-        docs = _ol_query({"title": title, "author": author}, title)
+        docs = _ol_query({"title": title, "author": author}, title, cancel_fn=cancel_fn)
         isbn = _pick_isbn_from_docs(docs, title)
         if isbn:
             return isbn
 
     # Pass 2: title only
-    docs = _ol_query({"title": title}, title)
+    docs = _ol_query({"title": title}, title, cancel_fn=cancel_fn)
     isbn = _pick_isbn_from_docs(docs, title)
     if isbn:
         return isbn

@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterable
 from lib import (
     LIBIB_HEADERS,
     EnrichmentResult,
+    OperationCancelled,
     classify_identifier,
     enrich_book,
     format_series_notes,
@@ -227,6 +228,7 @@ def scrape_chirp(
     password: str,
     max_pages: Optional[int],
     wait_fn: Callable[[], None] = _default_wait,
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> list[tuple[str, str, str]]:
     driver = _build_driver()
     try:
@@ -239,6 +241,9 @@ def scrape_chirp(
         page_number = 1
 
         while True:
+            if cancel_fn():
+                raise OperationCancelled()
+
             log.info("Scraping page %d…", page_number)
 
             WebDriverWait(driver, PAGE_WAIT_TIMEOUT).until(
@@ -283,12 +288,17 @@ def scrape_chirp(
 
 def resolve_isbns(
     books: list[tuple[str, str, str]],
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> list[tuple[str, str, Optional[str], str]]:
     total = len(books)
     records = []
 
     for idx, (title, author, cover) in enumerate(books, start=1):
-        isbn = get_isbn(title, author)
+        if cancel_fn():
+            raise OperationCancelled()
+
+        log.info("Resolving ISBN %d/%d: '%s'…", idx, total, title)
+        isbn = get_isbn(title, author, cancel_fn=cancel_fn)
         sleep_between_requests()
 
         records.append((title, author, isbn, cover))
@@ -309,14 +319,24 @@ def resolve_isbns(
 
 def enrich_books(
     records: list[tuple[str, str, Optional[str], str]],
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> list[tuple[str, str, Optional[str], str, EnrichmentResult]]:
     total = len(records)
     enriched = []
 
     for idx, (title, author, isbn, cover) in enumerate(records, start=1):
+        if cancel_fn():
+            raise OperationCancelled()
+
+        log.info("Enriching %d/%d: '%s'…", idx, total, title)
         upc_isbn10, ean_isbn13 = classify_identifier(isbn) if isbn else ("", "")
         result = enrich_book(
-            title, author, ean_isbn13 or None, upc_isbn10 or None, cover
+            title,
+            author,
+            ean_isbn13 or None,
+            upc_isbn10 or None,
+            cover,
+            cancel_fn=cancel_fn,
         )
         sleep_between_requests()
 
@@ -404,6 +424,7 @@ def run(
     output_dir: str = ".",
     no_enrich: bool = False,
     wait_fn: Callable[[], None] = _default_wait,
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> RunResult:
     """Scrape, resolve, enrich, and write — callable directly (CLI, reconciler,
     or a future GUI) without going through argparse. `main()` below is a thin
@@ -415,7 +436,7 @@ def run(
     # email, password = _prompt_credentials()
 
     log.info("Starting Chirp library scrape…")
-    books = scrape_chirp("", "", max_pages=pages, wait_fn=wait_fn)
+    books = scrape_chirp("", "", max_pages=pages, wait_fn=wait_fn, cancel_fn=cancel_fn)
 
     # os.environ.pop("CHIRP_EMAIL", None)
     # os.environ.pop("CHIRP_PASSWORD", None)
@@ -432,7 +453,7 @@ def run(
     books_deduped = dedupe_books_by_title(books)
 
     log.info("Found %d book(s). Resolving ISBNs via Open Library…", len(books_deduped))
-    records = resolve_isbns(books_deduped)
+    records = resolve_isbns(books_deduped, cancel_fn=cancel_fn)
 
     resolved = sum(1 for _, _, isbn, _ in records if isbn)
     unresolved_count = len(records) - resolved
@@ -454,7 +475,7 @@ def run(
             "Enriching %d book(s) via Open Library / Google Books / Wikidata…",
             len(records),
         )
-        enriched = enrich_books(records)
+        enriched = enrich_books(records, cancel_fn=cancel_fn)
 
     if dry_run:
         log.info("--dry-run set — no output files written.")

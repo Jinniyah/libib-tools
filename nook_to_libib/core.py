@@ -14,6 +14,7 @@ from typing import Optional
 from lib import (
     LIBIB_HEADERS,
     EnrichmentResult,
+    OperationCancelled,
     classify_identifier,
     dedupe_books_by_title,
     enrich_book,
@@ -222,11 +223,16 @@ def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str, str]]
 
 
 def scrape_nook(
-    max_pages: Optional[int], wait_fn: Callable[[], None] = _default_wait
+    max_pages: Optional[int],
+    wait_fn: Callable[[], None] = _default_wait,
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> list[tuple[str, str, str, str]]:
     driver = _build_driver()
     try:
         _login(driver, wait_fn=wait_fn)
+
+        if cancel_fn():
+            raise OperationCancelled()
 
         log.info("Scraping library…")
         WebDriverWait(driver, PAGE_WAIT_TIMEOUT).until(
@@ -283,6 +289,7 @@ def _dedupe_and_filter(
 
 def resolve_isbns(
     books: list[tuple[str, str, str, str]],
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> list[tuple[str, str, Optional[str], str]]:
     """Nook already supplies ISBNs from the DOM; only fall back to an Open
     Library lookup for the rare book missing one.
@@ -297,9 +304,13 @@ def resolve_isbns(
     resolved_count = 0
 
     for idx, (title, author, isbn, cover) in enumerate(books, start=1):
+        if cancel_fn():
+            raise OperationCancelled()
+
         resolved_isbn: Optional[str] = isbn or None
         if not resolved_isbn:
-            resolved_isbn = get_isbn(title, author)
+            log.info("Resolving ISBN %d/%d: '%s'…", idx, total, title)
+            resolved_isbn = get_isbn(title, author, cancel_fn=cancel_fn)
             sleep_between_requests()
 
         records.append((title, author, resolved_isbn, cover))
@@ -321,14 +332,24 @@ def resolve_isbns(
 
 def enrich_books(
     records: list[tuple[str, str, Optional[str], str]],
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> list[tuple[str, str, Optional[str], str, EnrichmentResult]]:
     total = len(records)
     enriched = []
 
     for idx, (title, author, isbn, cover) in enumerate(records, start=1):
+        if cancel_fn():
+            raise OperationCancelled()
+
+        log.info("Enriching %d/%d: '%s'…", idx, total, title)
         upc_isbn10, ean_isbn13 = classify_identifier(isbn) if isbn else ("", "")
         result = enrich_book(
-            title, author, ean_isbn13 or None, upc_isbn10 or None, cover
+            title,
+            author,
+            ean_isbn13 or None,
+            upc_isbn10 or None,
+            cover,
+            cancel_fn=cancel_fn,
         )
         sleep_between_requests()
 
@@ -412,13 +433,14 @@ def run(
     output_dir: str = ".",
     no_enrich: bool = False,
     wait_fn: Callable[[], None] = _default_wait,
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> RunResult:
     """Scrape, resolve, enrich, and write — callable directly (CLI, reconciler,
     or a future GUI) without going through argparse. `main()` below is a thin
     wrapper around this for the CLI entry point.
     """
     log.info("Starting Nook library scrape…")
-    books = scrape_nook(max_pages=pages, wait_fn=wait_fn)
+    books = scrape_nook(max_pages=pages, wait_fn=wait_fn, cancel_fn=cancel_fn)
 
     if not books:
         log.error("No books were scraped. Exiting.")
@@ -430,7 +452,7 @@ def run(
     books = _dedupe_and_filter(books)
 
     log.info("Found %d book(s). Resolving missing ISBNs via Open Library…", len(books))
-    records = resolve_isbns(books)
+    records = resolve_isbns(books, cancel_fn=cancel_fn)
 
     resolved = sum(1 for _, _, isbn, _ in records if isbn)
     unresolved_count = len(records) - resolved
@@ -452,7 +474,7 @@ def run(
             "Enriching %d book(s) via Open Library / Google Books / Wikidata…",
             len(records),
         )
-        enriched = enrich_books(records)
+        enriched = enrich_books(records, cancel_fn=cancel_fn)
 
     if dry_run:
         log.info("--dry-run set — no output files written.")

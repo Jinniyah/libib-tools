@@ -1,5 +1,6 @@
 # lib package — shared modules for ISBN resolution, Libib schema, and utilities.
 
+from lib.cancellation import OperationCancelled
 from lib.enricher import EnrichmentResult, enrich_book, format_series_notes
 from lib.openlibrary import (
     LIBIB_HEADERS,
@@ -20,4 +21,5 @@ __all__ = [
     "EnrichmentResult",
     "enrich_book",
     "format_series_notes",
+    "OperationCancelled",
 ]

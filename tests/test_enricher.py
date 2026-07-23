@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
+import lib.enricher as enricher_module
 from lib.enricher import (
     EnrichmentResult,
     _fetch_ai_metadata,
@@ -10,6 +11,8 @@ from lib.enricher import (
     _fetch_open_library,
     _fetch_openai_metadata,
     _fetch_wikidata_series,
+    _google_books_in_cooldown,
+    _trip_google_books_circuit_breaker,
     enrich_book,
     format_series_notes,
 )
@@ -17,7 +20,10 @@ from lib.enricher import (
 
 @pytest.fixture(autouse=True)
 def _no_sleep():
-    with patch("lib.enricher.sleep_between_requests"):
+    with (
+        patch("lib.enricher.sleep_between_requests"),
+        patch("lib.enricher._sleep_after_google_books"),
+    ):
         yield
 
 
@@ -25,6 +31,16 @@ def _no_sleep():
 def _clean_ai_env(monkeypatch):
     monkeypatch.delenv("AI_PROVIDER", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_BOOKS_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_google_books_circuit_breaker():
+    """Module-level state shared across the whole process — reset it around
+    every test so one test tripping the breaker can't leak into the next."""
+    enricher_module._google_books_blocked_until = 0.0
+    yield
+    enricher_module._google_books_blocked_until = 0.0
 
 
 # -----------------------------
@@ -72,7 +88,7 @@ def test_format_series_notes_no_series_empty_notes():
 
 @patch("lib.enricher._http_get_json")
 def test_fetch_open_library_isbn_hit(mock_get):
-    def side_effect(url, context, params=None, headers=None):
+    def side_effect(url, context, params=None, headers=None, cancel_fn=None):
         if url.startswith("https://openlibrary.org/isbn/"):
             return {
                 "publishers": ["Tor Books"],
@@ -99,7 +115,7 @@ def test_fetch_open_library_isbn_hit(mock_get):
 
 @patch("lib.enricher._http_get_json")
 def test_fetch_open_library_description_dict_value(mock_get):
-    def side_effect(url, context, params=None, headers=None):
+    def side_effect(url, context, params=None, headers=None, cancel_fn=None):
         if url.startswith("https://openlibrary.org/isbn/"):
             return {"works": [{"key": "/works/OL999W"}]}
         if url.endswith("/works/OL999W.json"):
@@ -180,6 +196,19 @@ def test_fetch_google_books_miss(mock_get):
     assert _fetch_google_books_metadata(None, "Title", "Author") == {}
 
 
+@patch("lib.enricher._http_get_json", return_value=None)
+def test_fetch_google_books_omits_key_param_when_not_configured(mock_get):
+    _fetch_google_books_metadata(None, "Title", "Author")
+    assert "key" not in mock_get.call_args.kwargs["params"]
+
+
+@patch("lib.enricher._http_get_json", return_value=None)
+def test_fetch_google_books_includes_key_param_when_configured(mock_get, monkeypatch):
+    monkeypatch.setenv("GOOGLE_BOOKS_API_KEY", "test-key-123")
+    _fetch_google_books_metadata(None, "Title", "Author")
+    assert mock_get.call_args.kwargs["params"]["key"] == "test-key-123"
+
+
 @patch("lib.enricher._http_get_json")
 def test_fetch_google_books_implausible_title_skipped(mock_get):
     mock_get.return_value = {
@@ -187,6 +216,48 @@ def test_fetch_google_books_implausible_title_skipped(mock_get):
     }
     result = _fetch_google_books_metadata(None, "Title", "Author")
     assert result == {}
+
+
+# -----------------------------
+# Google Books rate-limit circuit breaker
+# -----------------------------
+
+
+@patch("lib.enricher._http_get_json")
+def test_fetch_google_books_trips_breaker_on_rate_limit(mock_get):
+    def fake_http_get_json(url, context, params=None, headers=None, **kwargs):
+        on_rate_limited = kwargs.get("on_rate_limited")
+        if on_rate_limited:
+            on_rate_limited()
+        return None
+
+    mock_get.side_effect = fake_http_get_json
+
+    assert not _google_books_in_cooldown()
+    result = _fetch_google_books_metadata(None, "Title", "Author")
+    assert result == {}
+    assert _google_books_in_cooldown()
+
+
+@patch("lib.enricher._http_get_json")
+def test_fetch_google_books_skips_call_entirely_while_in_cooldown(mock_get):
+    _trip_google_books_circuit_breaker()
+
+    result = _fetch_google_books_metadata(None, "Title", "Author")
+
+    assert result == {}
+    mock_get.assert_not_called()
+
+
+@patch("lib.enricher._http_get_json")
+def test_fetch_google_books_resumes_after_cooldown_expires(mock_get):
+    mock_get.return_value = {"items": []}
+
+    enricher_module._google_books_blocked_until = 1.0  # long past
+
+    _fetch_google_books_metadata(None, "Title", "Author")
+
+    mock_get.assert_called_once()
 
 
 # -----------------------------
@@ -378,6 +449,16 @@ def test_fetch_ai_metadata_unknown_provider():
     assert _fetch_ai_metadata("made-up-provider", "Title", "Author", None) == {}
 
 
+@patch("lib.enricher._fetch_openai_metadata", return_value={"description": "hit"})
+def test_fetch_ai_metadata_provider_match_is_case_insensitive(mock_fetch):
+    assert _fetch_ai_metadata("OpenAI", "Title", "Author", None) == {
+        "description": "hit"
+    }
+    assert _fetch_ai_metadata(" OPENAI ", "Title", "Author", None) == {
+        "description": "hit"
+    }
+
+
 def test_fetch_openai_metadata_no_api_key():
     assert "OPENAI_API_KEY" not in os.environ
     assert _fetch_openai_metadata("Title", "Author", None) == {}
@@ -424,3 +505,62 @@ def test_fetch_openai_metadata_malformed_json(mock_post, monkeypatch):
 def test_fetch_openai_metadata_api_error(mock_post, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     assert _fetch_openai_metadata("Title", "Author", None) == {}
+
+
+@patch("lib.enricher.requests.post")
+def test_fetch_openai_metadata_requests_json_response_format(mock_post, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    mock_post.return_value.raise_for_status = lambda: None
+    mock_post.return_value.json.return_value = {
+        "choices": [{"message": {"content": "{}"}}]
+    }
+
+    _fetch_openai_metadata("Title", "Author", None)
+
+    assert mock_post.call_args.kwargs["json"]["response_format"] == {
+        "type": "json_object"
+    }
+
+
+@patch("lib.enricher.requests.post")
+def test_fetch_openai_metadata_asks_for_best_effort_estimates(mock_post, monkeypatch):
+    """The prior prompt ('use null if not confident') made the model default
+    to null for most fields on most books — this is the fix, so pin down
+    what's actually sent rather than let it silently regress."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    mock_post.return_value.raise_for_status = lambda: None
+    mock_post.return_value.json.return_value = {
+        "choices": [{"message": {"content": "{}"}}]
+    }
+
+    _fetch_openai_metadata("Some Title", "Some Author", "9781234567897")
+
+    messages = mock_post.call_args.kwargs["json"]["messages"]
+    assert messages[0]["role"] == "system"
+    assert "best good-faith estimate" in messages[0]["content"]
+    assert "do not default to null" in messages[0]["content"]
+
+    user_content = messages[1]["content"]
+    assert messages[1]["role"] == "user"
+    assert "Some Title" in user_content
+    assert "Some Author" in user_content
+    assert "9781234567897" in user_content
+    assert "4-digit" in user_content  # publish_date must be year-only
+    assert "approximate" in user_content  # page_count doesn't need to be exact
+
+
+@patch("lib.enricher.requests.post")
+def test_fetch_openai_metadata_logs_raw_content_when_no_fields_matched(
+    mock_post, monkeypatch, caplog
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    mock_post.return_value.raise_for_status = lambda: None
+    mock_post.return_value.json.return_value = {
+        "choices": [{"message": {"content": '{"unexpected_key": "value"}'}}]
+    }
+
+    with caplog.at_level("INFO", logger="lib.enricher"):
+        result = _fetch_openai_metadata("Title", "Author", None)
+
+    assert result == {}
+    assert any("unexpected_key" in record.message for record in caplog.records)

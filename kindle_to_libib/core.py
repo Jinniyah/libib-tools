@@ -9,11 +9,12 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from lib import (
     LIBIB_HEADERS,
     EnrichmentResult,
+    OperationCancelled,
     classify_identifier,
     enrich_book,
     format_series_notes,
@@ -98,12 +99,36 @@ def parse_args() -> argparse.Namespace:
 
 
 def _prompt_credentials() -> tuple[str, str]:
+    """CLI default: env vars first, falling back to an interactive terminal
+    prompt. Only safe for a real terminal — see credentials_from_env() for
+    the GUI's non-blocking alternative."""
     email = os.environ.get("KINDLE_EMAIL") or input("Enter your Amazon email: ").strip()
     password = os.environ.get("KINDLE_PASSWORD") or getpass.getpass(
         "Enter your Amazon password: "
     )
     if not email or not password:
         raise ValueError("Both email and password are required.")
+    return email, password
+
+
+_MISSING_CREDENTIALS_MESSAGE = (
+    "KINDLE_EMAIL and KINDLE_PASSWORD are not set. Add these lines to your "
+    ".env file, fill in your Amazon login, then quit and restart the server "
+    "so it picks up the change:\n"
+    "KINDLE_EMAIL=\n"
+    "KINDLE_PASSWORD="
+)
+
+
+def credentials_from_env() -> tuple[str, str]:
+    """Non-interactive variant for callers with no terminal to prompt on (the
+    web GUI) — raises immediately with a copy-pasteable .env snippet instead
+    of blocking on stdin, which would otherwise hang the whole server with no
+    way to cancel."""
+    email = os.environ.get("KINDLE_EMAIL")
+    password = os.environ.get("KINDLE_PASSWORD")
+    if not email or not password:
+        raise ValueError(_MISSING_CREDENTIALS_MESSAGE)
     return email, password
 
 
@@ -257,7 +282,10 @@ def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str]]:
 
 
 def scrape_kindle(
-    email: str, password: str, max_pages: Optional[int]
+    email: str,
+    password: str,
+    max_pages: Optional[int],
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> list[tuple[str, str, str]]:
     driver = _build_driver()
     try:
@@ -270,6 +298,9 @@ def scrape_kindle(
         page_number = 1
 
         while True:
+            if cancel_fn():
+                raise OperationCancelled()
+
             log.info("Scraping page %d…", page_number)
 
             WebDriverWait(driver, PAGE_WAIT_TIMEOUT).until(
@@ -324,12 +355,17 @@ def scrape_kindle(
 
 def resolve_isbns(
     books: list[tuple[str, str, str]],
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> list[tuple[str, str, Optional[str], str]]:
     total = len(books)
     records = []
 
     for idx, (title, author, cover) in enumerate(books, start=1):
-        isbn = get_isbn(title, author)  # <-- SHARED LOOKUP
+        if cancel_fn():
+            raise OperationCancelled()
+
+        log.info("Resolving ISBN %d/%d: '%s'…", idx, total, title)
+        isbn = get_isbn(title, author, cancel_fn=cancel_fn)  # <-- SHARED LOOKUP
         sleep_between_requests()  # <-- SHARED DELAY
 
         records.append((title, author, isbn, cover))
@@ -350,14 +386,24 @@ def resolve_isbns(
 
 def enrich_books(
     records: list[tuple[str, str, Optional[str], str]],
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> list[tuple[str, str, Optional[str], str, EnrichmentResult]]:
     total = len(records)
     enriched = []
 
     for idx, (title, author, isbn, cover) in enumerate(records, start=1):
+        if cancel_fn():
+            raise OperationCancelled()
+
+        log.info("Enriching %d/%d: '%s'…", idx, total, title)
         upc_isbn10, ean_isbn13 = classify_identifier(isbn) if isbn else ("", "")
         result = enrich_book(
-            title, author, ean_isbn13 or None, upc_isbn10 or None, cover
+            title,
+            author,
+            ean_isbn13 or None,
+            upc_isbn10 or None,
+            cover,
+            cancel_fn=cancel_fn,
         )
         sleep_between_requests()
 
@@ -450,21 +496,25 @@ def run(
     dry_run: bool = False,
     output_dir: str = ".",
     no_enrich: bool = False,
+    cancel_fn: Callable[[], bool] = lambda: False,
+    credentials_fn: Callable[[], tuple[str, str]] = _prompt_credentials,
 ) -> RunResult:
     """Scrape, resolve, enrich, and write — callable directly (CLI, reconciler,
     or a future GUI) without going through argparse. `main()` below is a thin
     wrapper around this for the CLI entry point.
 
-    Credentials are read the same way regardless of caller: env vars first,
-    falling back to an interactive prompt only if unset — see
-    _prompt_credentials(). No email/password parameters here on purpose;
-    credentials stay env-var/prompt-only, never passed through as plain
-    function arguments from a GUI layer.
+    Credentials are read via credentials_fn — env vars first, falling back to
+    an interactive prompt only for the CLI default (_prompt_credentials).
+    The GUI passes credentials_from_env instead, which never blocks on stdin:
+    a web page has no terminal to answer an input() prompt, so blocking would
+    hang the whole server with no way to cancel. No email/password parameters
+    on run() itself on purpose — credentials stay env-var/prompt-only, never
+    passed through as plain function arguments from a GUI layer.
     """
-    email, password = _prompt_credentials()
+    email, password = credentials_fn()
 
     log.info("Starting Kindle library scrape…")
-    books = scrape_kindle(email, password, max_pages=pages)
+    books = scrape_kindle(email, password, max_pages=pages, cancel_fn=cancel_fn)
 
     # Clear credentials from memory and environment as soon as the scrape completes
     del email, password
@@ -482,7 +532,7 @@ def run(
         )
 
     log.info("Found %d book(s). Resolving ISBNs via Open Library…", len(books))
-    records = resolve_isbns(books)
+    records = resolve_isbns(books, cancel_fn=cancel_fn)
 
     resolved = sum(1 for _, _, isbn, _ in records if isbn)
     unresolved_count = len(records) - resolved
@@ -504,7 +554,7 @@ def run(
             "Enriching %d book(s) via Open Library / Google Books / Wikidata…",
             len(records),
         )
-        enriched = enrich_books(records)
+        enriched = enrich_books(records, cancel_fn=cancel_fn)
 
     if dry_run:
         log.info("--dry-run set — no output files written.")
