@@ -64,6 +64,21 @@ _KINDLE_UI_GARBAGE = frozenset(
     {"content", "devices", "preferences", "privacy settings"}
 )
 
+# Confirmed live against a real 2000+-book library (2026-07-24): the left-nav
+# tabs ("Content", "Devices", "Preferences", "Privacy Settings" — exactly
+# _KINDLE_UI_GARBAGE above) are each a `<div role="listitem">`, and they sit
+# before the real book rows in the DOM. Every real book row is a
+# `<tr class="ListItem-module_row__3orql" role="listitem">` — a `tr`, never a
+# `div`. The previous selector matched both, which was harmless for the
+# scraped book list itself (the 4 nav "books" get dropped later by
+# _KINDLE_UI_GARBAGE anyway) but broke pagination outright: the page-advance
+# check reads items[0], and with the div nav tabs sorted first, items[0] was
+# always one of those static nav elements — identical on every page — so the
+# wait for the page to visibly change timed out on page 1 -> 2 even though
+# the click had genuinely navigated (confirmed: the URL did update to
+# ?pageNumber=2). tr-only avoids matching the nav tabs at all.
+_BOOK_ROW_SELECTOR = "tr[role='listitem']"
+
 # ==========================
 # LOGGING
 # ==========================
@@ -157,17 +172,13 @@ def _login(driver: webdriver.Chrome, email: str, password: str) -> None:
         WebDriverWait(driver, PAGE_WAIT_TIMEOUT).until(
             EC.any_of(
                 EC.presence_of_element_located((By.ID, "ap_email")),
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "tr[role='listitem'], div[role='listitem']")
-                ),
+                EC.presence_of_element_located((By.CSS_SELECTOR, _BOOK_ROW_SELECTOR)),
             )
         )
     except Exception:
         log.warning("Initial page did not show sign-in or content list promptly.")
 
-    content_items = driver.find_elements(
-        By.CSS_SELECTOR, "tr[role='listitem'], div[role='listitem']"
-    )
+    content_items = driver.find_elements(By.CSS_SELECTOR, _BOOK_ROW_SELECTOR)
     if content_items:
         log.info("Already signed in; content list detected.")
         return
@@ -193,9 +204,7 @@ def _login(driver: webdriver.Chrome, email: str, password: str) -> None:
 
     log.info("Waiting for Kindle content list after login…")
     WebDriverWait(driver, PAGE_WAIT_TIMEOUT * 2).until(
-        EC.presence_of_element_located(
-            (By.CSS_SELECTOR, "tr[role='listitem'], div[role='listitem']")
-        )
+        EC.presence_of_element_located((By.CSS_SELECTOR, _BOOK_ROW_SELECTOR))
     )
     log.info("Login successful or already authenticated; content list visible.")
 
@@ -317,14 +326,10 @@ def scrape_kindle(
             log.info("Scraping page %d…", page_number)
 
             WebDriverWait(driver, PAGE_WAIT_TIMEOUT).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "tr[role='listitem'], div[role='listitem']")
-                )
+                EC.presence_of_element_located((By.CSS_SELECTOR, _BOOK_ROW_SELECTOR))
             )
 
-            items = driver.find_elements(
-                By.CSS_SELECTOR, "tr[role='listitem'], div[role='listitem']"
-            )
+            items = driver.find_elements(By.CSS_SELECTOR, _BOOK_ROW_SELECTOR)
             page_books = _parse_items(items)
             books.extend(page_books)
 
@@ -391,9 +396,7 @@ def scrape_kindle(
             if prev_first_item_text is not None:
 
                 def _page_advanced(d: webdriver.Chrome) -> bool:
-                    current = d.find_elements(
-                        By.CSS_SELECTOR, "tr[role='listitem'], div[role='listitem']"
-                    )
+                    current = d.find_elements(By.CSS_SELECTOR, _BOOK_ROW_SELECTOR)
                     if not current:
                         return False
                     try:
