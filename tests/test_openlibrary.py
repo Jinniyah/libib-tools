@@ -1,16 +1,30 @@
 from unittest.mock import patch
 
+import pytest
+
+import lib.openlibrary as openlibrary_module
 from lib.openlibrary import (
     _normalize_isbn,
     _valid_isbn10,
     _valid_isbn13,
     _best_isbn,
     _title_is_plausible,
+    _ol_in_cooldown,
     _ol_query,
+    _trip_ol_circuit_breaker,
     dedupe_books_by_title,
     filter_invalid_books,
     get_isbn,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_ol_circuit_breaker():
+    """Module-level state shared across the whole process — reset it around
+    every test so one test tripping the breaker can't leak into the next."""
+    openlibrary_module._ol_blocked_until = 0.0
+    yield
+    openlibrary_module._ol_blocked_until = 0.0
 
 
 def test_normalize_isbn():
@@ -118,6 +132,47 @@ def test_dedupe_by_title_records_dropped_entries_for_human_review():
 # -----------------------------
 # filter_invalid_books
 # -----------------------------
+
+
+# -----------------------------
+# Open Library circuit breaker
+# -----------------------------
+
+
+@patch("lib.http_retry.requests.get")
+def test_ol_query_trips_circuit_breaker_after_exhausting_retries(mock_get):
+    mock_get.return_value.raise_for_status.side_effect = Exception("503 error")
+    mock_get.return_value.status_code = 503
+    mock_get.return_value.headers = {}
+
+    with patch("lib.http_retry.time.sleep"):
+        assert not _ol_in_cooldown()
+        docs = _ol_query({"title": "Test"}, "Test")
+        assert docs == []
+        assert _ol_in_cooldown()
+
+
+@patch("lib.http_retry.requests.get")
+def test_ol_query_skips_call_entirely_while_in_cooldown(mock_get):
+    _trip_ol_circuit_breaker()
+
+    docs = _ol_query({"title": "Test"}, "Test")
+
+    assert docs == []
+    mock_get.assert_not_called()
+
+
+@patch("lib.http_retry.requests.get")
+def test_ol_query_resumes_after_cooldown_expires(mock_get):
+    mock_get.return_value.json.return_value = {"docs": [{"title": "Test"}]}
+    mock_get.return_value.raise_for_status = lambda: None
+
+    openlibrary_module._ol_blocked_until = 1.0  # long past
+
+    docs = _ol_query({"title": "Test"}, "Test")
+
+    assert docs == [{"title": "Test"}]
+    mock_get.assert_called_once()
 
 
 def test_filter_invalid_books_records_dropped_entries_for_human_review():

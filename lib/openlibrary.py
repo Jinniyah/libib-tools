@@ -23,8 +23,47 @@ _OL_BASE_PARAMS = {
     "fields": "title,isbn",
 }
 
+# Open Library's own API docs: unidentified requests are capped at 1/s;
+# requests with a User-Agent identifying the app get 3/s. Sending this
+# doesn't just raise our ceiling — Open Library's docs specifically warn
+# that unidentified bulk traffic is more likely to be throttled/blocked
+# outright, which lines up with the 503 storms seen in practice.
+_OL_HEADERS = {"User-Agent": "LibibTools/0.1 (https://github.com/Jinniyah/libib-tools)"}
+
 # Randomized delay range (seconds)
 ISBN_DELAY_RANGE = (0.8, 1.6)
+
+# Circuit breaker: Open Library's search endpoint has been observed to
+# return 503 ("no server available") in multi-minute storms that clear on
+# their own, interspersed with otherwise-clean requests — a backend
+# capacity issue (see e.g. internetarchive/openlibrary#6804), not a hard
+# quota block like Google Books'. Once a request exhausts every retry
+# against one of these storms, skip Open Library entirely for a short
+# cooldown instead of every subsequent book (there can be thousands, per a
+# full Kindle library) independently re-paying the same ~30s retry tax to
+# rediscover the same outage. Short relative to Google's 5-minute cooldown
+# since these storms have been observed to clear in well under that.
+_OL_COOLDOWN_SECONDS = 90.0
+_ol_blocked_until = 0.0
+
+
+def _ol_in_cooldown() -> bool:
+    return time.time() < _ol_blocked_until
+
+
+def _ol_cooldown_remaining() -> float:
+    return max(0.0, _ol_blocked_until - time.time())
+
+
+def _trip_ol_circuit_breaker() -> None:
+    global _ol_blocked_until
+    if not _ol_in_cooldown():
+        log.warning(
+            "Open Library failed repeatedly (likely a temporary outage) — "
+            "pausing Open Library lookups for %.0fs.",
+            _OL_COOLDOWN_SECONDS,
+        )
+    _ol_blocked_until = time.time() + _OL_COOLDOWN_SECONDS
 
 
 # -----------------------------
@@ -162,12 +201,23 @@ def _ol_query(
     cancel_fn: Optional[Callable[[], bool]] = None,
 ) -> list[dict]:
     """Execute one Open Library search with retries and exponential backoff."""
+    if _ol_in_cooldown():
+        log.info(
+            "Skipping Open Library for '%s' — still cooling down after "
+            "repeated errors (%.0fs left).",
+            title_for_log,
+            _ol_cooldown_remaining(),
+        )
+        return []
+
     data = request_json(
         _OL_URL,
         title_for_log,
         params={**_OL_BASE_PARAMS, **params},
+        headers=_OL_HEADERS,
         max_retries=4,
         cancel_fn=cancel_fn,
+        on_exhausted=_trip_ol_circuit_breaker,
     )
     return (data or {}).get("docs", [])
 

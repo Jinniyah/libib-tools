@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 
 import lib.enricher as enricher_module
+import lib.openlibrary as openlibrary_module
 from lib.enricher import (
     EnrichmentResult,
     _fetch_ai_metadata,
@@ -13,6 +14,7 @@ from lib.enricher import (
     _fetch_wikidata_series,
     _google_books_in_cooldown,
     _trip_google_books_circuit_breaker,
+    _trip_ol_circuit_breaker,
     enrich_book,
     format_series_notes,
 )
@@ -41,6 +43,13 @@ def _reset_google_books_circuit_breaker():
     enricher_module._google_books_blocked_until = 0.0
     yield
     enricher_module._google_books_blocked_until = 0.0
+
+
+@pytest.fixture(autouse=True)
+def _reset_ol_circuit_breaker():
+    openlibrary_module._ol_blocked_until = 0.0
+    yield
+    openlibrary_module._ol_blocked_until = 0.0
 
 
 # -----------------------------
@@ -88,7 +97,7 @@ def test_format_series_notes_no_series_empty_notes():
 
 @patch("lib.enricher._http_get_json")
 def test_fetch_open_library_isbn_hit(mock_get):
-    def side_effect(url, context, params=None, headers=None, cancel_fn=None):
+    def side_effect(url, context, params=None, headers=None, cancel_fn=None, **kwargs):
         if url.startswith("https://openlibrary.org/isbn/"):
             return {
                 "publishers": ["Tor Books"],
@@ -115,7 +124,7 @@ def test_fetch_open_library_isbn_hit(mock_get):
 
 @patch("lib.enricher._http_get_json")
 def test_fetch_open_library_description_dict_value(mock_get):
-    def side_effect(url, context, params=None, headers=None, cancel_fn=None):
+    def side_effect(url, context, params=None, headers=None, cancel_fn=None, **kwargs):
         if url.startswith("https://openlibrary.org/isbn/"):
             return {"works": [{"key": "/works/OL999W"}]}
         if url.endswith("/works/OL999W.json"):
@@ -126,6 +135,16 @@ def test_fetch_open_library_description_dict_value(mock_get):
 
     result = _fetch_open_library("9781234567897", "Title", "Author")
     assert result["description"] == "Nested desc."
+
+
+@patch("lib.enricher._http_get_json")
+def test_fetch_open_library_skips_call_entirely_while_in_cooldown(mock_get):
+    _trip_ol_circuit_breaker()
+
+    result = _fetch_open_library("9781234567897", "Title", "Author")
+
+    assert result == {}
+    mock_get.assert_not_called()
 
 
 @patch("lib.enricher._ol_query")

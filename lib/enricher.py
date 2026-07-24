@@ -17,8 +17,12 @@ from lib.http_retry import request_json
 from lib.http_retry import _sleep as _interruptible_sleep
 from lib.openlibrary import (
     _best_isbn,
+    _ol_cooldown_remaining,
+    _OL_HEADERS,
+    _ol_in_cooldown,
     _ol_query,
     _title_is_plausible,
+    _trip_ol_circuit_breaker,
     sleep_between_requests,
 )
 
@@ -150,6 +154,7 @@ def _http_get_json(
     cancel_fn: Optional[Callable[[], bool]] = None,
     max_retries: int = 3,
     on_rate_limited: Optional[Callable[[], None]] = None,
+    on_exhausted: Optional[Callable[[], None]] = None,
 ) -> Optional[dict]:
     """GET a URL and return parsed JSON, with retry/backoff. None on 404 or exhaustion."""
     return request_json(
@@ -160,6 +165,7 @@ def _http_get_json(
         max_retries=max_retries,
         cancel_fn=cancel_fn,
         on_rate_limited=on_rate_limited,
+        on_exhausted=on_exhausted,
     )
 
 
@@ -179,13 +185,26 @@ def _fetch_open_library(
     cancel_fn: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Fetch description/publisher/publish_date/length_of/ISBNs from Open Library."""
+    if _ol_in_cooldown():
+        log.info(
+            "Skipping Open Library for '%s' — still cooling down after "
+            "repeated errors (%.0fs left).",
+            title,
+            _ol_cooldown_remaining(),
+        )
+        return {}
+
     result: dict = {}
     work_key: Optional[str] = None
 
     edition = None
     if isbn13:
         edition = _http_get_json(
-            _OL_ISBN_URL.format(isbn=isbn13), context=title, cancel_fn=cancel_fn
+            _OL_ISBN_URL.format(isbn=isbn13),
+            context=title,
+            headers=_OL_HEADERS,
+            cancel_fn=cancel_fn,
+            on_exhausted=_trip_ol_circuit_breaker,
         )
         sleep_between_requests()
 
@@ -236,7 +255,11 @@ def _fetch_open_library(
     if work_key:
         sleep_between_requests()
         work = _http_get_json(
-            _OL_WORKS_URL.format(key=work_key), context=title, cancel_fn=cancel_fn
+            _OL_WORKS_URL.format(key=work_key),
+            context=title,
+            headers=_OL_HEADERS,
+            cancel_fn=cancel_fn,
+            on_exhausted=_trip_ol_circuit_breaker,
         )
         if work:
             description = work.get("description")

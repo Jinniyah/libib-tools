@@ -96,6 +96,44 @@ def test_request_json_429_fires_on_rate_limited_before_giving_up(mock_get, mock_
     on_rate_limited.assert_called_once()
 
 
+@patch("lib.http_retry.time.sleep")
+@patch("lib.http_retry.requests.get")
+def test_request_json_fires_on_exhausted_after_all_retries_fail(mock_get, mock_sleep):
+    mock_get.return_value = _response(503)
+    on_exhausted = MagicMock()
+
+    result = request_json(
+        "http://example.com", "ctx", max_retries=2, on_exhausted=on_exhausted
+    )
+
+    assert result is None
+    on_exhausted.assert_called_once()
+
+
+@patch("lib.http_retry.time.sleep")
+@patch("lib.http_retry.requests.get")
+def test_request_json_404_does_not_fire_on_exhausted(mock_get, mock_sleep):
+    mock_get.return_value = _response(404)
+    on_exhausted = MagicMock()
+
+    result = request_json("http://example.com", "ctx", on_exhausted=on_exhausted)
+
+    assert result is None
+    on_exhausted.assert_not_called()
+
+
+@patch("lib.http_retry.time.sleep")
+@patch("lib.http_retry.requests.get")
+def test_request_json_success_does_not_fire_on_exhausted(mock_get, mock_sleep):
+    mock_get.return_value = _response(200, {"ok": True})
+    on_exhausted = MagicMock()
+
+    result = request_json("http://example.com", "ctx", on_exhausted=on_exhausted)
+
+    assert result == {"ok": True}
+    on_exhausted.assert_not_called()
+
+
 def test_error_reason_extracts_google_style_error_body():
     resp = _response(
         429,

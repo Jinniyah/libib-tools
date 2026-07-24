@@ -1013,6 +1013,61 @@ re-discovering the same block for the cost of 3 wasted retries each.
   request params when set; the circuit breaker stays in place either way as
   a safety net. Documented in README + `.env.example`.
 
+### Enrichment reliability — Open Library circuit breaker + identified requests — COMPLETE (2026-07-23)
+Prompted by a real 2000+/400+-book Kindle/Chirp run hitting repeated Open
+Library 503 ("Service Temporarily Unavailable") storms — several separate
+books each burning all 4 retries (~30s) before failing, then more books
+hitting the same wall minutes later. Researched Open Library's own published
+rate-limit policy and general 429-vs-503 retry practice before changing
+anything (see sources below) rather than guessing at a bigger backoff.
+- Key finding: Open Library's API docs state unidentified requests are capped
+  at 1 request/second, while requests carrying a `User-Agent` identifying the
+  app get 3/second — and that unidentified bulk traffic is more likely to be
+  throttled/blocked outright. This codebase's Open Library requests (unlike
+  the Wikidata ones) were sending no `User-Agent` at all.
+- Key finding: the observed 503s are a known, acknowledged Open Library
+  backend reliability issue (see internetarchive/openlibrary#6804) — bursty
+  and self-clearing over a few minutes, not a hard quota block like Google
+  Books'. General practice treats 5xx and 429 differently: 429 needs a longer
+  respectful backoff (already handled, see the Google Books entry above); a
+  transient 5xx can retry with a shorter delay, but a *sustained* run of them
+  means the service is down and every further request should back off
+  entirely for a while rather than each independently re-discovering the
+  outage.
+- [x] `_OL_HEADERS` (`lib/openlibrary.py`) — identifying `User-Agent`, same
+  style already used for Wikidata requests — added to every Open Library
+  call (`_ol_query`, plus the direct ISBN-edition/works fetches in
+  `lib/enricher.py`'s `_fetch_open_library()`, which don't go through
+  `_ol_query`).
+- [x] `lib/http_retry.py`'s `request_json()` gained `on_exhausted` — fires
+  once, only when every retry attempt failed (never on a 404, which is a
+  legitimate "not found" answer). Distinct from `on_rate_limited` (which
+  fires on the very first 429, before waiting): a single transient 503 that
+  succeeds on retry should not trip a breaker, only a request that failed
+  outright after every attempt should.
+- [x] `lib/openlibrary.py` gained a module-level circuit breaker mirroring
+  the Google Books one: `_ol_in_cooldown()`/`_trip_ol_circuit_breaker()`, a
+  90-second cooldown (short relative to Google's 5 minutes, since these
+  storms have been observed clearing well inside that) wired as
+  `_ol_query()`'s `on_exhausted`. `_fetch_open_library()` in
+  `lib/enricher.py` also checks the cooldown at entry before making its own
+  direct calls, so a tripped breaker skips Open Library entirely (falling
+  straight through to Google Books/AI fallback) instead of every subsequent
+  book paying the same ~30s retry tax rediscovering the same outage.
+- [x] Tests: `tests/test_http_retry.py` (`on_exhausted` fires on exhaustion,
+  not on 404 or success), `tests/test_openlibrary.py` (breaker trips/skips/
+  resumes), `tests/test_enricher.py` (`_fetch_open_library` skips entirely
+  while in cooldown).
+
+Sources consulted: [Open Library API docs](https://openlibrary.org/developers/api)
+and [internetarchive/openlibrary#8534](https://github.com/internetarchive/openlibrary/issues/8534)
+(rate-limit policy); [internetarchive/openlibrary#6804](https://github.com/internetarchive/openlibrary/issues/6804)
+(503 reliability issue); general retry/circuit-breaker practice distinguishing
+429 (throttling, longer backoff) from 5xx (transient capacity, shorter
+per-attempt backoff but circuit-break on sustained failure) per standard
+resilience-pattern guidance (e.g. Grab Engineering's "Designing Resilient
+Systems" series).
+
 ### GUI-Settings-1 — settings page
 - [ ] `WEB-37` Read-only env-var status display (`configured`/`not configured`,
   never the value) for `KINDLE_EMAIL`/`KINDLE_PASSWORD`/`AI_PROVIDER`/`OPENAI_API_KEY`

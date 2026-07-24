@@ -173,15 +173,25 @@ or `lib.enricher` directly in new code — always use `from lib import ...`.
 ### `lib/http_retry.py` (not exported via `lib/__init__.py` — internal to `lib/`)
 
 `request_json(url, context, *, params=None, headers=None, max_retries=3,
-base_backoff=2.0, cancel_fn=None)` — the single GET-with-retry helper used by
-both `lib/enricher.py`'s `_http_get_json` and `lib/openlibrary.py`'s
-`_ol_query` (previously duplicated between the two, and already drifted: 3 vs
-4 `max_retries`). Handles HTTP 429 distinctly — honors `Retry-After` when
-present, otherwise waits at least 5s, since the plain exponential backoff
-used for other errors is provably too short against Google Books' actual
-rate-limit window (observed 3 consecutive 429s at 2s/4s/8s spacing). Accepts
-an optional `cancel_fn` so a cancel request lands within ~1s even mid-retry,
-instead of waiting out the full backoff/Retry-After chain.
+base_backoff=2.0, cancel_fn=None, on_rate_limited=None, on_exhausted=None)` —
+the single GET-with-retry helper used by both `lib/enricher.py`'s
+`_http_get_json` and `lib/openlibrary.py`'s `_ol_query` (previously
+duplicated between the two, and already drifted: 3 vs 4 `max_retries`).
+Handles HTTP 429 distinctly — honors `Retry-After` when present, otherwise
+waits at least 5s, since the plain exponential backoff used for other errors
+is provably too short against Google Books' actual rate-limit window
+(observed 3 consecutive 429s at 2s/4s/8s spacing). Accepts an optional
+`cancel_fn` so a cancel request lands within ~1s even mid-retry, instead of
+waiting out the full backoff/Retry-After chain. `on_rate_limited` fires the
+instant a 429 is seen (before waiting) — used by `lib/enricher.py`'s Google
+Books circuit breaker. `on_exhausted` fires once, only if every retry
+attempt failed outright (never on a 404) — used by `lib/openlibrary.py`'s
+Open Library circuit breaker (`_ol_in_cooldown()`/
+`_trip_ol_circuit_breaker()`, 90s cooldown), since Open Library's observed
+503s come in multi-minute storms that a per-book retry alone doesn't handle
+economically at multi-thousand-book scale. Open Library requests also now
+send an identifying `User-Agent` (`_OL_HEADERS`) — Open Library's own API
+docs cap unidentified requests at 1/s vs. 3/s for identified ones.
 
 ---
 

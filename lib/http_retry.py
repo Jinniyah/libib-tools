@@ -38,6 +38,7 @@ def request_json(
     base_backoff: float = 2.0,
     cancel_fn: Optional[Callable[[], bool]] = None,
     on_rate_limited: Optional[Callable[[], None]] = None,
+    on_exhausted: Optional[Callable[[], None]] = None,
 ) -> Optional[dict]:
     """GET a URL and return parsed JSON, with retry/backoff. None on 404 or exhaustion.
 
@@ -48,6 +49,11 @@ def request_json(
     on_rate_limited, if given, fires the moment a 429 is seen (before the
     wait) — lets a caller trip its own circuit breaker instead of learning
     about the rate limit only after every retry is exhausted.
+    on_exhausted, if given, fires once, only when every retry has failed
+    (never on a 404, which is a legitimate "not found" answer, not a
+    failure) — lets a caller trip a breaker for a service that's down
+    outright (e.g. a run of 503s) so the *next* request skips straight past
+    it instead of re-discovering the same outage from scratch.
     """
     backoff = base_backoff
 
@@ -111,6 +117,8 @@ def request_json(
             _sleep(backoff, cancel_fn)
             backoff *= 2
 
+    if on_exhausted is not None:
+        on_exhausted()
     return None
 
 
