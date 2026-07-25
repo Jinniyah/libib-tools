@@ -8,7 +8,11 @@
 # rationale): ISBN-exact matching runs first and is provider-agnostic — an
 # ISBN doesn't care what platform it's on, and this also lets ambiguous
 # "digital"-only entries get resolved without ever needing to guess a
-# provider. Fuzzy title/author matching runs second and is provider-scoped —
+# provider. It also runs even for entries that would otherwise be skipped
+# entirely (no digital tag at all, e.g. added to Libib without ever being
+# tagged) — an ISBN match is authoritative regardless of tags, so checking
+# it first can only rescue matches, never produce a false one. Fuzzy
+# title/author matching runs second and is provider-scoped —
 # only checked against the providers actually named on that Libib entry's
 # tags — and is a *greedy* best-score assignment, not an optimal bipartite
 # matching solver: at personal-library scale (low hundreds of gap candidates,
@@ -98,14 +102,19 @@ def _isbn_match(entry: LibibEntry, scraped_isbn: Optional[str]) -> bool:
     return False
 
 
-def _author_overlap(a: str, b: str) -> bool:
+def author_overlap(a: str, b: str) -> bool:
     """Loose author corroboration: any shared word longer than 2 characters."""
     a_words = {w for w in re.sub(r"[^\w\s]", "", a.lower()).split() if len(w) > 2}
     b_words = {w for w in re.sub(r"[^\w\s]", "", b.lower()).split() if len(w) > 2}
     return bool(a_words & b_words)
 
 
-def _title_score(a: str, b: str) -> float:
+def title_score(a: str, b: str) -> float:
+    """Raw title similarity, with no plausibility gate applied — public
+    (not just find_fuzzy_match's internal detail) since the interactive
+    review feature (libib_reconcile/review.py) reuses it directly to rank
+    "maybe" candidates the automated matcher's _title_is_plausible() gate
+    rejected outright."""
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
@@ -150,35 +159,52 @@ def reconcile(
                     "medium"
                     if entry.creators
                     and author
-                    and _author_overlap(entry.creators, author)
+                    and author_overlap(entry.creators, author)
                     else "low"
                 )
                 candidates.append(
-                    (_title_score(entry.title, title), provider, idx, book, confidence)
+                    (title_score(entry.title, title), provider, idx, book, confidence)
                 )
 
         if not candidates:
             return None
 
-        candidates.sort(key=lambda c: c[0], reverse=True)
+        # Sort key must be fully deterministic, not just "highest score
+        # first": entry.providers is a set, so the order candidates were
+        # appended in (and thus which one a stable sort keeps on a tied
+        # score) depended on Python's per-process string hash randomization
+        # — confirmed live (2026-07-24): the same inputs produced a
+        # different gap list across back-to-back runs whenever a book was
+        # owned on two scraped platforms with an identical title score.
+        # Breaking ties by provider name then pool index makes the result
+        # reproducible regardless of set iteration order.
+        candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
         _, provider, idx, book, confidence = candidates[0]
         return provider, idx, book, confidence
 
     libib_results: list[MatchResult] = []
 
     for entry in libib_entries:
-        if entry.skip:
-            libib_results.append(
-                MatchResult(entry, None, None, None, None, "out_of_scope")
-            )
-            continue
-
+        # ISBN-exact runs even for skip=True entries, checked *before* the
+        # skip cutoff — an ISBN match is authoritative regardless of tags,
+        # so there's no false-positive risk in trying it universally. Real
+        # gap found live (2026-07-24): 46 entries in a real export had no
+        # tags at all (should_skip() == True, e.g. added without ever being
+        # tagged), and 38 of those had an ISBN on file that this ordering
+        # previously never got a chance to check — contradicting this
+        # project's own stated principle of always trying ISBN-exact first.
         isbn_hit = find_isbn_match(entry)
         if isbn_hit:
             provider, idx, book = isbn_hit
             consumed.add((provider, idx))
             libib_results.append(
                 MatchResult(entry, provider, book, "high", "exact_isbn", "matched")
+            )
+            continue
+
+        if entry.skip:
+            libib_results.append(
+                MatchResult(entry, None, None, None, None, "out_of_scope")
             )
             continue
 

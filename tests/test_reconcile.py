@@ -149,6 +149,29 @@ def test_greedy_fuzzy_match_picks_best_score():
 # ==========================
 
 
+def test_fuzzy_match_tie_break_is_deterministic_not_hash_order_dependent():
+    """A book owned on two scraped platforms with an identical title score
+    must resolve to the same provider every time. entry.providers is a set,
+    so iterating it directly (as find_fuzzy_match once did) let Python's
+    per-process string hash randomization decide which provider's candidate
+    landed first in a tie — and a stable sort on score alone just preserves
+    whichever came first. Confirmed live (2026-07-24): the same real input
+    data produced a different gap list across three back-to-back runs.
+    Asserting the specific winner (alphabetically-first provider, "chirp"
+    over "kobo") pins down the actual deterministic tie-break rule rather
+    than just re-running in-process, where the hash seed can't change
+    anyway."""
+    entry = _entry("Oathblood", "Mercedes Lackey", providers={"chirp", "kobo"})
+    scraped = {
+        "chirp": [("Oathblood", "Mercedes Lackey", None, "chirp-cover")],
+        "kobo": [("Oathblood", "Mercedes Lackey", None, "kobo-cover")],
+    }
+
+    match = reconcile([entry], scraped).libib_results[0]
+
+    assert match.provider == "chirp"
+
+
 def test_multi_provider_entry_matches_either_scrape():
     entry = _entry("Mistborn", "Brandon Sanderson", providers={"kindle", "kobo"})
     scraped = {"kobo": [("Mistborn", "Brandon Sanderson", None, "cover")]}
@@ -205,7 +228,12 @@ def test_ambiguous_entry_without_isbn_stays_ambiguous():
     assert result.libib_results[0].status == "ambiguous"
 
 
-def test_skip_entry_is_out_of_scope_even_with_perfect_match_available():
+def test_skip_entry_can_still_isbn_match():
+    """A skip=True entry (no digital tag at all) can still resolve via
+    ISBN-exact — it's authoritative regardless of tags, so there's no
+    false-positive risk in trying it. Found live 2026-07-24: 46 entries in a
+    real export had no tags at all, and 38 of those had an ISBN on file that
+    the old skip-before-ISBN ordering never got a chance to check."""
     entry = _entry(
         "Deleted Book", "Author", providers=set(), ean_isbn13="9780593135204", skip=True
     )
@@ -214,8 +242,32 @@ def test_skip_entry_is_out_of_scope_even_with_perfect_match_available():
     result = reconcile([entry], scraped)
 
     match = result.libib_results[0]
+    assert match.status == "matched"
+    assert match.confidence == "high"
+
+
+def test_skip_entry_without_isbn_match_is_out_of_scope():
+    entry = _entry("Deleted Book", "Author", providers=set(), skip=True)
+
+    result = reconcile(
+        [entry], {"kindle": [("Something Else", "Nobody", None, "cover")]}
+    )
+
+    match = result.libib_results[0]
     assert match.status == "out_of_scope"
     assert match.book is None
+
+
+def test_skip_entry_does_not_get_fuzzy_matched():
+    """Skip entries still must not fall through to fuzzy matching even if
+    they happen to carry provider tags — only the provider-agnostic
+    ISBN-exact pass is allowed to rescue them."""
+    entry = _entry("Some Book", "Some Author", providers={"kindle"}, skip=True)
+    scraped = {"kindle": [("Some Book", "Some Author", None, "cover")]}
+
+    result = reconcile([entry], scraped)
+
+    assert result.libib_results[0].status == "out_of_scope"
 
 
 def test_no_match_found_is_libib_only_orphan():

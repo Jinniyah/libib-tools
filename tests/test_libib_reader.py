@@ -62,6 +62,13 @@ def test_classify_providers_audiobook_maps_to_chirp():
     assert classify_providers({"audiobook", "chirp"}) == {"chirp"}
 
 
+def test_classify_providers_bn_maps_to_nook():
+    """Real export data (2026-07-24) has entries tagged "bn" (Barnes &
+    Noble's own abbreviation) instead of "nook" — without this mapping they
+    have no recognized provider at all."""
+    assert classify_providers({"bn", "digital"}) == {"nook"}
+
+
 def test_classify_providers_cross_format():
     assert classify_providers({"chirp", "digital", "kindle", "nook"}) == {
         "chirp",
@@ -111,6 +118,12 @@ def test_should_skip_digital_alone_kept():
     """A bare 'digital' tag is ambiguous, not skippable — it still represents
     a digital copy, just of an unknown platform."""
     assert should_skip({"digital"}) is False
+
+
+def test_should_skip_bn_alone_kept():
+    """A bare 'bn' tag (no explicit 'digital') still represents a digital
+    Nook copy and must not be treated as physical-only."""
+    assert should_skip({"bn"}) is False
 
 
 # ==========================

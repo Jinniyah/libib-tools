@@ -66,10 +66,15 @@ KOBO_LIBRARY_PATH = "/us/en/library/books"
 #       h2.title.product-field > a               ← title text
 #       p.authors.product-field
 #         span.visible-contributors
-#           span > a.contributor-name            ← author text
+#           span.contributor-name                ← author text
+#             (an <a> when Kobo has an author-search page for them, else a
+#             plain <span> with the same class — confirmed live, 2026-07-24:
+#             41% of a real 186-book library had a blank author because the
+#             original selector required an <a>, which a huge, genre-diverse
+#             swath of real books simply don't get)
 _SEL_BOOK_ITEM = "li.item-wrapper.book"
 _SEL_TITLE = "h2.title.product-field a"
-_SEL_AUTHOR = "p.authors.product-field a.contributor-name"
+_SEL_AUTHOR = "p.authors.product-field .contributor-name"
 _SEL_COVER = "div.item-image img"
 _SEL_NEXT = "a.next:not(.disabled), button.next:not([disabled])"
 

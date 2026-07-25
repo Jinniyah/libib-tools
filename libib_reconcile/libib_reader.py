@@ -49,18 +49,24 @@ LIBIB_EXPORT_HEADERS: list[str] = [
 
 # Tag keywords that map to a scraper provider. "audiobook" is included because
 # Chirp entries are commonly tagged "audiobook, chirp" rather than "chirp" alone.
+# "bn" (Barnes & Noble's own abbreviation) is included alongside "nook" because
+# real export data has both — confirmed live (2026-07-24): 6 entries tagged
+# "bn" instead of "nook", none tagged both, so this isn't a redundant alias —
+# without it those entries had no recognized provider at all and were
+# invisible to Nook's provider-scoped fuzzy matching.
 _PROVIDER_KEYWORDS: dict[str, str] = {
     "kindle": "kindle",
     "kobo": "kobo",
     "chirp": "chirp",
     "audiobook": "chirp",
     "nook": "nook",
+    "bn": "nook",
     "google": "google",
 }
 
 # Any of these present means the entry represents a digital copy of some kind.
 _DIGITAL_KEYWORDS: frozenset[str] = frozenset(
-    {"kindle", "kobo", "chirp", "audiobook", "nook", "google", "digital"}
+    {"kindle", "kobo", "chirp", "audiobook", "nook", "bn", "google", "digital"}
 )
 
 # Columns a usable export must have; anything else is tolerated (Libib may add
