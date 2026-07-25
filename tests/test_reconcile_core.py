@@ -1,7 +1,7 @@
 import csv
 import os
 import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -255,3 +255,47 @@ def test_run_integration_known_gap():
         with open(result.summary_path, encoding="utf-8") as f:
             summary_text = f.read()
         assert "Missing (gap):     1" in summary_text
+
+        assert result.review_snapshot_path is not None
+        assert os.path.exists(result.review_snapshot_path)
+
+
+# ==========================
+# run() — review snapshot + cancel_fn (checkbook review feature)
+# ==========================
+
+
+def test_run_dry_run_has_no_review_snapshot_path():
+    with tempfile.TemporaryDirectory() as tmp:
+        result = run(
+            libib_path=LIBIB_EXPORT_FIXTURE,
+            kindle=KINDLE_SCRAPE_FIXTURE,
+            output_dir=tmp,
+            dry_run=True,
+        )
+    assert result.review_snapshot_path is None
+
+
+@patch("libib_reconcile.core.enrich_gap_books")
+@patch("libib_reconcile.core.enrich_missing_isbns")
+def test_run_threads_cancel_fn_into_both_enrichment_stages(
+    mock_enrich_missing_isbns, mock_enrich_gap_books
+):
+    mock_enrich_missing_isbns.side_effect = lambda result, cancel_fn: result
+    mock_enrich_gap_books.return_value = []
+
+    def my_cancel_fn() -> bool:
+        return False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run(
+            libib_path=LIBIB_EXPORT_FIXTURE,
+            kindle=KINDLE_SCRAPE_FIXTURE,
+            output_dir=tmp,
+            cancel_fn=my_cancel_fn,
+        )
+
+    mock_enrich_missing_isbns.assert_called_once_with(ANY, cancel_fn=my_cancel_fn)
+    mock_enrich_gap_books.assert_called_once_with(
+        ANY, no_enrich=False, cancel_fn=my_cancel_fn
+    )

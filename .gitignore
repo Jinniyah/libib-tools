@@ -23,3 +23,6 @@ __pycache__/
 /venv
 /kobo_to_libib_unresolved_2026-06-09_17-12.txt
 /! Output
+# Reconciliation review state — personal library data, same reasoning as *.csv
+reconcile_*_review_snapshot.json
+reconcile_review_decisions.json

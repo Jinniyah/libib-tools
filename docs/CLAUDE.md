@@ -516,7 +516,8 @@ Scan tag set for these keywords:
 - `kindle` → Kindle scrape
 - `kobo` → Kobo scrape
 - `chirp` or `audiobook` → Chirp scrape
-- `nook` → Nook scrape
+- `nook` or `bn` → Nook scrape (`bn` = Barnes & Noble's own abbreviation; found
+  live in real export data, 2026-07-24 — 6 entries used it instead of `nook`)
 - `google` → Google Books scrape
 - `digital` present but none of the above → ambiguous (report separately)
 - No digital keyword at all → physical only → skip entirely
@@ -565,8 +566,73 @@ libib_reconcile/
 ├── libib_reader.py   # Parse and classify Libib export CSV — COMPLETE (Rec-1)
 ├── reconciler.py     # Matching engine (ISBN-exact + fuzzy) — COMPLETE (Rec-2)
 ├── isbn_enricher.py  # Open Library lookup for gap books — COMPLETE (Rec-3)
-└── output.py         # All output files (gap CSV, reports) — COMPLETE (Rec-3)
+├── output.py         # All output files (gap CSV, reports) — COMPLETE (Rec-3)
+└── review.py         # Interactive checkbook-style review — COMPLETE (GUI-Reconcile-1..3)
 ```
+
+**`review.py` public API** (complete — see `docs/backlog.md`'s `GUI-Reconcile-1..3`
+entry for the full design writeup):
+```python
+def stable_gap_key(provider: str, book: ScrapedBook) -> str: ...
+def stable_libib_key(entry: LibibEntry) -> str: ...
+
+def write_review_snapshot(
+    result: ReconcileResult,
+    enriched_gap_books: list[tuple[ScrapedBookResult, EnrichmentResult]],
+    source_paths: dict[str, Optional[str]], output_dir: str, timestamp: str,
+) -> str: ...
+def load_review_snapshot(path: str) -> ReviewSnapshot: ...
+
+def load_decisions(output_dir: str) -> dict[str, Decision]: ...
+def save_decision(
+    output_dir: str, gap_key: str, status: str,
+    libib_key: Optional[str] = None, note: Optional[str] = None,
+) -> dict[str, Decision]: ...
+
+def rank_candidates(gap, candidate_pool, decisions, limit=25, score_floor=0.15) -> list[dict]: ...
+def search_candidates(query, candidate_pool, decisions, gap_key, limit=50) -> tuple[list, int]: ...
+
+def gap_has_enrichment(gap: GapBookDict) -> bool: ...
+def refresh_gap_enrichment(snapshot_path: str, gap_key: str) -> GapBookDict: ...
+def set_manual_enrichment(snapshot_path: str, gap_key: str, fields: dict) -> GapBookDict: ...
+
+def finalize_review(snapshot_path: str, output_dir: str) -> tuple[str, Optional[str]]: ...
+```
+`refresh_gap_enrichment()` (2026-07-24) — on-demand, single-book re-enrichment
+triggered by hand from the review page, for books that came out with little
+or no metadata (a `--no-enrich` run, or `enrich_book()`'s Open Library/Google
+Books/AI/Wikidata chain simply finding nothing the first time). One real
+network call, not job-backed — a single book takes seconds, nowhere near
+scrape-job territory. Merges the fresh result into the existing one
+field-by-field (new value wins only if truthy) so a retry that finds *less*
+than before can never regress already-found data; mutates the snapshot file
+in place, atomically — "write-once" was about not needing to redo the whole
+computation, not a promise that one book's metadata is frozen forever. Wired
+into `webapp/app.py` as `POST /api/reconcile/review/enrich`, and
+`GET /api/reconcile/review/gaps` includes a `has_enrichment` flag per gap so
+the review page can flag books worth a manual retry at a glance.
+
+`set_manual_enrichment()` (2026-07-25) — the human counterpart: lets someone
+type metadata in directly instead of relying only on automated/AI lookups.
+Unlike `refresh_gap_enrichment()`'s never-regress merge, this sets exactly
+what's given, including an intentional blank (a human clearing a wrong value
+is a real edit, not noise to guard against). Wired as
+`POST /api/reconcile/review/manual-enrichment`; the review page shows
+editable description/publisher/publish-date/page-count/series fields,
+pre-filled with current values, right next to the "Try to find more info"
+button.
+
+Two JSON files per output directory: `reconcile_{timestamp}_review_snapshot.json`
+(write-once, captures gap-book enrichment so the review page never re-hits the
+network) and `reconcile_review_decisions.json` (mutable, un-timestamped,
+atomic-written — the only durable/restart-surviving state anywhere in this
+project; `webapp/jobs/registry.py`'s `Job` is deliberately in-memory-only by
+contrast). Confirmed matches never write back to Libib — only affect this
+tool's own output (`finalize_review()`'s reviewed gap CSV + tag-suggestions
+report). The candidate pool is every Libib entry regardless of match status
+(only `deleted`/`removed`-tagged entries excluded) — a real live bug
+(2026-07-25) found that excluding already-`matched` entries made a wrongly-
+or partially-matched entry unfindable and uncorrectable via search.
 
 **`libib_reader.py` public API** (complete):
 ```python
@@ -633,6 +699,20 @@ def reconcile(
 3. Once a scraped book is consumed by any match, it's removed from further
    consideration — no double-booking one book across two Libib entries.
 
+**Tie-break must not depend on set iteration order (real bug found and fixed,
+Rec-5 preview, 2026-07-24):** `find_fuzzy_match()` builds its candidate list by
+iterating `entry.providers`, which is a `set[str]` — Python randomizes string
+hashing per process, so set iteration order (and therefore which candidate a
+*stable* sort keeps on a tied title score) varied run to run. Confirmed live:
+the same real export + same three scrape CSVs produced a different gap count
+(179 vs 179 vs 180) across back-to-back reruns whenever a book was owned on
+two scraped platforms with an identical title score (e.g. an audiobook +
+ebook copy of the same Mercedes Lackey title). Fixed by sorting candidates on
+a fully explicit key — `(-score, provider, idx)` — so ties always resolve the
+same way (alphabetically-first provider wins) regardless of set order.
+Regression test: `test_fuzzy_match_tie_break_is_deterministic_not_hash_order_dependent`
+in `tests/test_reconcile.py`.
+
 **Dedup gotcha (real bug found and fixed in Rec-2):** `_dedupe_scraped_books()`
 reuses `lib.dedupe_books_by_title()`, which only understands 3-tuples. The first
 implementation reattached `cover` after dedup via a `{isbn: cover}` dict — which
@@ -678,10 +758,11 @@ its own — a single reconcile run's files share one timestamp (`reconcile_<ts>_
 writer stays independently testable without freezing the clock. The four report
 writers return `None` (write nothing) when there's nothing to report; `write_gap_csv`
 and `write_reconciliation_report` always write a file, even if empty/all-zero, matching
-the scraper `write_csv()` convention of always producing a CSV. `_PROVIDER_TAGS` in
-`output.py` duplicates each scraper's `LIBIB_TYPE` constant as static data rather than
-importing from scraper internals — the reconciler package doesn't depend on the
-scraper packages for anything but the shared `lib/`.
+the scraper `write_csv()` convention of always producing a CSV. `PROVIDER_TAGS` in
+`output.py` (public — `review.py`'s finalize step needs it too) duplicates each
+scraper's `LIBIB_TYPE` constant as static data rather than importing from scraper
+internals — the reconciler package doesn't depend on the scraper packages for
+anything but the shared `lib/`.
 
 **`core.py` public API** (complete):
 ```python
@@ -857,6 +938,17 @@ no router-splitting yet, revisit if it gets unwieldy):
 | `GET /scrape/{provider}/jobs/{id}` | JSON job detail: status, error, `output_dir`, download links |
 | `POST /scrape/{provider}/jobs/{id}/continue` | Unblocks the login wait; 409 if not `waiting_for_login` |
 | `POST /scrape/{provider}/jobs/{id}/cancel` | Cooperative cancel (login wait, and — since `GUI-BACKEND-4a` — between scrape pages/books/retries); 409 if already terminal |
+| `GET /reconcile` | Run-a-reconcile form page (Libib + per-provider CSV path fields, no login-wait section) |
+| `POST /reconcile/jobs` | Start a reconcile job (`ReconcileOptions` body); `provider="reconcile"` reuses `Job`/`JobRegistry` unchanged, one-live-job guard included for free |
+| `GET /reconcile/jobs/{id}/events` | SSE log/status stream — literally `_job_event_stream`, no reconcile-specific code |
+| `GET /reconcile/jobs/{id}` | JSON job detail: status, error, `output_dir`, `review_snapshot_path`, download links |
+| `POST /reconcile/jobs/{id}/cancel` | Same cooperative-cancel pattern as scrape jobs |
+| `GET /reconcile/review` | The interactive checkbook-review page (`?snapshot=<path>`) |
+| `GET /api/reconcile/review/gaps` | Full gap list + current decision per item (small enough to return whole, filtered client-side) |
+| `GET /api/reconcile/review/candidates` | Ranked (default) or searched (`?q=`) candidate Libib entries for one gap book |
+| `POST /api/reconcile/review/decisions` | Upsert a human decision (`confirmed_match`/`confirmed_new`/`undecided`) — writes straight to `reconcile_review_decisions.json`, not through the job system at all |
+| `POST /reconcile/review/finalize` | Regenerate the reviewed gap CSV + tag-suggestions report from accumulated decisions |
+| `GET /reconcile/review/download` | Dedicated download route for finalize output — not job-scoped, since finalize output can be regenerated long after the originating Job (and its in-memory object) are gone, including across a server restart |
 | `GET /downloads/{job_id}/{filename}` | Serves a file — **only** if `filename` matches one of the job's own known result paths by basename; never joins user input onto a directory |
 
 **Security implemented so far:** `127.0.0.1`-only binding; downloads matched
@@ -920,8 +1012,9 @@ bug documented above. No longer an open action item.
 | GUI-Frontend-3 | 2026-07-22 | Run-a-scraper page (`scrape.html` + `app.js`) — form, live log via SSE, login-wait UI, download links. Added `event: status` SSE events and a job-detail JSON endpoint beyond the original ticket scope, since the original design (only a final `done` event) couldn't support a live Continue button. `app.js` itself unverified in a real browser at the time — closed out in the GUI-live-testing session below. |
 | GUI-Backend-4a | 2026-07-23 | Cooperative cancel (checked between scrape pages/books/HTTP retries, not just login-wait) across all four scrapers; `lib/http_retry.py` (centralized retry helper, real 429/`Retry-After` handling — found via manual testing that Google Books' 429s weren't being backed off long enough); `POST /shutdown` + `GET /api/jobs-live` + a Quit button; fixed a real UX bug where the login-wait Continue button looked unresponsive for ~1s; `Job.output_dir` + a "Files saved to" note alongside the download buttons |
 | GUI-live-testing | 2026-07-23 | First real end-to-end browser testing of `app.js`/all four scrapers, driven entirely by live user bug reports rather than a written test plan. Chain of enrichment-reliability fixes, each one prompted by the previous fix not being enough: wider jitter → didn't help (Google's anonymous quota doesn't clear in seconds) → circuit breaker (skip Google Books for a cooldown after one 429 instead of re-discovering the same block every book) → optional `GOOGLE_BOOKS_API_KEY` (the actual root-cause fix — bigger separate quota) → discovered and fixed `AI_PROVIDER` case-sensitivity and a total absence of AI-fallback success logging. Then a `.env`/webdriver_manager credentials hang (Kindle blocking the whole server on a stdin prompt the browser can't answer) → `credentials_from_env()` non-interactive variant. Then, after adding per-book progress logging still didn't produce visible output, traced it to the session's most significant find: **the root logger's level was silently stuck at WARNING under the GUI the entire time** (each scraper's `logging.basicConfig(level=logging.INFO, ...)` no-ops once the root logger already has a handler — which `log_bridge.install()` always attaches first, at webapp startup) — every `log.info(...)` progress line, across every prior GUI session, had been silently dropped; fixed with one `root.setLevel(logging.INFO)` line, confirmed by reproducing the broken behavior standalone before shipping the fix. Also: `[hidden]` CSS bug (a `.card { display: flex }` rule beat the browser's default `[hidden] { display: none }` regardless of specificity, so the login-wait card never actually hid), Cancel-button/status-row layout fixes, and a `.env` + `GOOGLE_BOOKS_API_KEY`/`credentials_from_env` setup walkthrough. |
-| Rec-5 | Next up | Integration run against real data. **Not yet done — this is the very next step.** User is about to run a full scrape of their real collection across all four providers (validated working end-to-end as of the session above) specifically to generate the real scrape CSVs this needs; also grab a fresh Libib export first (the committed reference file is from 2026-06-09, stale). Then `python -m libib_reconcile --libib <fresh-export.csv> --chirp ... --kindle ... --kobo ... --nook ...` (or `--scrape` if driving scrapers directly from the reconciler CLI) against the real data — matching quality/fuzzy-threshold tuning can't be meaningfully validated on small samples. |
-| GUI-Reconcile-1..3 | TBD | Libib CSV upload, reconcile job wiring, results page |
+| Rec-5-preview | 2026-07-24 | Real integration run against Chirp/Kobo/Nook + a fresh Libib export (Kindle still scraping at the time) — the first real test of the reconciler against production data. Immediately surfaced real bugs from manual sanity-checking: `bn` (Barnes & Noble's own tag abbreviation) not recognized as a Nook provider keyword; a genuine non-determinism bug in `find_fuzzy_match()` (Python's per-process string hash randomization affecting tie-break order via `entry.providers` set iteration — same gap list produced different results across identical reruns, fixed with an explicit `(-score, provider, idx)` sort key); untagged Libib entries (`should_skip() == True`) never even attempting ISBN-exact matching, contradicting the project's own "always try ISBN first" principle; and a Kobo scraper bug (`_SEL_AUTHOR` required an `<a>` tag, but Kobo renders unlinked author names as a plain `<span>` with the same class — 41% of a real 186-book Kobo library had a blank author as a result). All fixed same-session; see `docs/backlog.md`'s "Matching edge cases"/"Tag edge cases" and the Kobo scraper entry for full writeups. |
+| GUI-Reconcile-1..3 | 2026-07-24 | Reconcile job page + interactive checkbook-style review, built directly off what Rec-5-preview's manual sanity-checking surfaced — see the full writeup in `docs/backlog.md`. New `libib_reconcile/review.py` (stable content-hash keys, JSON snapshot + durable decisions file, candidate ranking/search, finalize). Superseded the original CSV-upload plan with local file-path fields. |
+| Rec-5 | 2026-07-24 | Full integration run against Chirp/Kindle(2,048 books)/Nook — first real end-to-end test including Kindle. Also served as the manual end-to-end verification for GUI-Reconcile-1..3 (real snapshot produced from real data, not mocked). |
 | GUI-Settings-1 / GUI-Security-1 / GUI-Polish-1 | TBD | Settings page, CSRF/path-traversal hardening, docs |
 
 ---

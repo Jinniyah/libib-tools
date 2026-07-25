@@ -1,7 +1,8 @@
 # webapp/app.py
 #
 # FastAPI app factory: dashboard, job control (events/continue/cancel),
-# scraper dispatch, and downloads.
+# scraper dispatch, reconciliation (run + interactive checkbook-style
+# review), and downloads.
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import importlib
 import inspect
 import os
 import queue as queue_module
+import re
 import threading
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -23,6 +25,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+from libib_reconcile import core as reconcile_core
+from libib_reconcile import review as reconcile_review
 from webapp.jobs.log_bridge import install as install_log_bridge
 from webapp.jobs.registry import Job, JobAlreadyRunningError, JobRegistry
 from webapp.jobs.runner import start_job
@@ -67,6 +71,61 @@ class ScrapeOptions(BaseModel):
     dry_run: bool = False
     output_dir: str = "."
     no_enrich: bool = False
+
+
+class ReconcileOptions(BaseModel):
+    """No `--scrape`/`dry_run` toggle on purpose — the GUI reconcile page
+    always points at pre-existing local CSV paths (same trust boundary as
+    the CLI's own --libib/--chirp/etc. flags on this 127.0.0.1-only,
+    single-user tool) and always runs for real, since the whole point of
+    running it here is to get a review snapshot, which a dry run wouldn't
+    produce."""
+
+    libib_path: str
+    chirp: Optional[str] = None
+    kindle: Optional[str] = None
+    kobo: Optional[str] = None
+    nook: Optional[str] = None
+    google: Optional[str] = None
+    output_dir: str = "."
+    no_enrich: bool = False
+
+
+class ReconcileDecisionRequest(BaseModel):
+    gap_key: str
+    status: str  # "confirmed_match" | "confirmed_new" | "undecided"
+    libib_key: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ReconcileEnrichRequest(BaseModel):
+    gap_key: str
+
+
+class ReconcileManualEnrichmentRequest(BaseModel):
+    """Always submitted as a full form snapshot, not a partial patch — every
+    field reflects whatever's currently in the review page's edit form, so
+    an intentionally-cleared field (empty string) is a real edit, not
+    something to ignore."""
+
+    gap_key: str
+    description: Optional[str] = None
+    publisher: Optional[str] = None
+    publish_date: Optional[str] = None
+    length_of: Optional[str] = None
+    series_name: Optional[str] = None
+    series_position: Optional[int] = None
+
+
+# Filenames finalize_review() can ever produce — "reconcile_" prefix plus
+# safe characters only (no `/`, `..`, or anything path-breaking), checked
+# together with a parent-directory match below. Same "never blindly join
+# user input" posture as /downloads/{job_id}/{filename}, adapted since
+# finalize output isn't tied to any Job (it can be regenerated long after
+# the originating reconcile job — and its in-memory Job object — are gone,
+# including across a server restart, which is the whole point of this
+# feature persisting to disk in the first place).
+_REVIEW_DOWNLOAD_PATTERN = re.compile(r"^reconcile_[\w\-]+\.(csv|txt)$")
 
 
 @dataclass
@@ -177,6 +236,28 @@ def _build_run_callable(module: Any, options: ScrapeOptions) -> Any:
     return run_callable
 
 
+def _build_reconcile_run_callable(options: ReconcileOptions) -> Any:
+    """Builds the (wait_fn, cancel_fn) closure start_job() expects. wait_fn
+    is simply never invoked — libib_reconcile.core.run() has no manual-login
+    step, the same reason Kindle's own scraper run() doesn't accept a
+    wait_fn parameter either."""
+
+    def run_callable(wait_fn: Any, cancel_fn: Any) -> Any:
+        return reconcile_core.run(
+            libib_path=options.libib_path,
+            output_dir=options.output_dir,
+            chirp=options.chirp,
+            kindle=options.kindle,
+            kobo=options.kobo,
+            nook=options.nook,
+            google=options.google,
+            no_enrich=options.no_enrich,
+            cancel_fn=cancel_fn,
+        )
+
+    return run_callable
+
+
 def _extract_result_paths(result: Any) -> list[str]:
     """Pull every string field off a RunResult/ReconcileRunResult-shaped
     dataclass — generic across both, since both are just a handful of
@@ -213,6 +294,23 @@ def _get_job_or_404(provider: str, job_id: str) -> Job:
 
 def _any_job_live() -> bool:
     return any(job.status not in _TERMINAL_STATUSES for job in registry.all())
+
+
+def _review_output_dir(snapshot_path: str) -> str:
+    """The review snapshot and its decisions file always live side by side
+    (libib_reconcile/review.py writes both into the same output_dir) — so
+    the decisions file's location is always derivable from the snapshot
+    path alone, rather than needing its own separate query parameter."""
+    return str(Path(snapshot_path).resolve().parent)
+
+
+def _decision_summary(
+    decisions: dict[str, reconcile_review.Decision], gap_key: str
+) -> Optional[dict[str, Any]]:
+    d = decisions.get(gap_key)
+    if d is None:
+        return None
+    return {"status": d.status, "libib_key": d.libib_key, "note": d.note}
 
 
 @asynccontextmanager
@@ -362,6 +460,169 @@ def create_app() -> FastAPI:
             job.output_dir = str(Path(options.output_dir).resolve())
 
         return {"job_id": job.id, "status": job.status}
+
+    @app.get("/reconcile")
+    def reconcile_page(request: Request) -> HTMLResponse:
+        return templates.TemplateResponse(request, "reconcile.html", {})
+
+    @app.post("/reconcile/jobs")
+    def reconcile_job_start(options: ReconcileOptions) -> dict[str, str]:
+        run_callable = _build_reconcile_run_callable(options)
+
+        try:
+            job = start_job(registry, "reconcile", run_callable)
+        except JobAlreadyRunningError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        job.output_dir = str(Path(options.output_dir).resolve())
+        return {"job_id": job.id, "status": job.status}
+
+    @app.get("/reconcile/jobs/{job_id}/events")
+    def reconcile_job_events(job_id: str) -> StreamingResponse:
+        job = _get_job_or_404("reconcile", job_id)
+        return StreamingResponse(_job_event_stream(job), media_type="text/event-stream")
+
+    @app.get("/reconcile/jobs/{job_id}")
+    def reconcile_job_detail(job_id: str) -> dict[str, Any]:
+        job = _get_job_or_404("reconcile", job_id)
+        return {
+            "job_id": job.id,
+            "status": job.status,
+            "error": job.error,
+            "output_dir": job.output_dir,
+            "review_snapshot_path": getattr(job.result, "review_snapshot_path", None),
+            "downloads": [
+                {"filename": Path(p).name, "url": f"/downloads/{job.id}/{Path(p).name}"}
+                for p in _extract_result_paths(job.result)
+            ],
+        }
+
+    @app.post("/reconcile/jobs/{job_id}/cancel")
+    def reconcile_job_cancel(job_id: str) -> dict[str, bool]:
+        job = _get_job_or_404("reconcile", job_id)
+        if job.status in _TERMINAL_STATUSES:
+            raise HTTPException(
+                status_code=409, detail=f"Job already finished (status: {job.status})."
+            )
+        job.cancel_event.set()
+        return {"ok": True}
+
+    @app.get("/reconcile/review")
+    def reconcile_review_page(request: Request, snapshot: str) -> HTMLResponse:
+        # `snapshot` is a raw local path typed/carried forward by the user,
+        # same trust boundary as the --libib text field on this
+        # 127.0.0.1-only, single-user tool — not a new hole. See
+        # _REVIEW_DOWNLOAD_PATTERN's comment for the one route here that
+        # *does* need stricter validation (it serves file bytes back).
+        return templates.TemplateResponse(
+            request, "reconcile_review.html", {"snapshot": snapshot}
+        )
+
+    @app.get("/api/reconcile/review/gaps")
+    def reconcile_review_gaps(snapshot: str) -> dict[str, Any]:
+        data = reconcile_review.load_review_snapshot(snapshot)
+        decisions = reconcile_review.load_decisions(_review_output_dir(snapshot))
+        gaps = [
+            {
+                **gap,
+                "decision": _decision_summary(decisions, gap["key"]),
+                "has_enrichment": reconcile_review.gap_has_enrichment(gap),
+            }
+            for gap in data["gap_books"]
+        ]
+        return {"gaps": gaps}
+
+    @app.get("/api/reconcile/review/candidates")
+    def reconcile_review_candidates(
+        snapshot: str, gap_key: str, q: Optional[str] = None
+    ) -> dict[str, Any]:
+        data = reconcile_review.load_review_snapshot(snapshot)
+        decisions = reconcile_review.load_decisions(_review_output_dir(snapshot))
+
+        gap = next((g for g in data["gap_books"] if g["key"] == gap_key), None)
+        if gap is None:
+            raise HTTPException(
+                status_code=404, detail="Gap book not found in this snapshot"
+            )
+
+        if q:
+            results, total = reconcile_review.search_candidates(
+                q, data["candidate_pool"], decisions, gap_key
+            )
+            return {"mode": "search", "candidates": results, "total": total}
+
+        ranked = reconcile_review.rank_candidates(
+            gap, data["candidate_pool"], decisions
+        )
+        return {"mode": "ranked", "candidates": ranked}
+
+    @app.post("/api/reconcile/review/decisions")
+    def reconcile_review_save_decision(
+        snapshot: str, body: ReconcileDecisionRequest
+    ) -> dict[str, bool]:
+        reconcile_review.save_decision(
+            _review_output_dir(snapshot),
+            body.gap_key,
+            body.status,
+            libib_key=body.libib_key,
+            note=body.note,
+        )
+        return {"ok": True}
+
+    @app.post("/api/reconcile/review/enrich")
+    def reconcile_review_enrich(
+        snapshot: str, body: ReconcileEnrichRequest
+    ) -> dict[str, Any]:
+        # One book, a real (few-second) network call — not job-backed, that
+        # machinery exists for hundreds-of-books-scale work like the initial
+        # reconcile run, not a single on-demand retry.
+        try:
+            gap = reconcile_review.refresh_gap_enrichment(snapshot, body.gap_key)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"gap": gap, "has_enrichment": reconcile_review.gap_has_enrichment(gap)}
+
+    @app.post("/api/reconcile/review/manual-enrichment")
+    def reconcile_review_manual_enrichment(
+        snapshot: str, body: ReconcileManualEnrichmentRequest
+    ) -> dict[str, Any]:
+        fields = body.model_dump(exclude={"gap_key"})
+        try:
+            gap = reconcile_review.set_manual_enrichment(snapshot, body.gap_key, fields)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"gap": gap, "has_enrichment": reconcile_review.gap_has_enrichment(gap)}
+
+    @app.post("/reconcile/review/finalize")
+    def reconcile_review_finalize(snapshot: str) -> dict[str, Any]:
+        output_dir = _review_output_dir(snapshot)
+        gap_csv_path, tag_report_path = reconcile_review.finalize_review(
+            snapshot, output_dir
+        )
+
+        def _download(path: str) -> dict[str, str]:
+            filename = Path(path).name
+            return {
+                "filename": filename,
+                "url": f"/reconcile/review/download?dir={output_dir}&filename={filename}",
+            }
+
+        return {
+            "gap_csv": _download(gap_csv_path),
+            "tag_report": _download(tag_report_path) if tag_report_path else None,
+        }
+
+    @app.get("/reconcile/review/download")
+    def reconcile_review_download(dir: str, filename: str) -> FileResponse:
+        if not _REVIEW_DOWNLOAD_PATTERN.match(filename):
+            raise HTTPException(status_code=404, detail="File not found")
+
+        resolved_dir = Path(dir).resolve()
+        candidate = resolved_dir / filename
+        if candidate.parent != resolved_dir or not candidate.is_file():
+            raise HTTPException(status_code=404, detail="File not found")
+
+        return FileResponse(candidate, filename=filename)
 
     @app.get("/downloads/{job_id}/{filename}")
     def download_file(job_id: str, filename: str) -> FileResponse:

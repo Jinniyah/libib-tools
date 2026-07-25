@@ -8,8 +8,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
-from lib import get_isbn, sleep_between_requests
+from lib import OperationCancelled, get_isbn, sleep_between_requests
 
 from libib_reconcile.reconciler import ReconcileResult, ScrapedBookResult
 
@@ -18,7 +19,10 @@ log = logging.getLogger(__name__)
 ISBN_LOG_INTERVAL: int = 25
 
 
-def enrich_missing_isbns(result: ReconcileResult) -> ReconcileResult:
+def enrich_missing_isbns(
+    result: ReconcileResult,
+    cancel_fn: Callable[[], bool] = lambda: False,
+) -> ReconcileResult:
     """Resolve ISBNs for scraped books classified missing_from_libib that
     don't already have one. `libib_results` pass through unchanged.
     """
@@ -43,9 +47,12 @@ def enrich_missing_isbns(result: ReconcileResult) -> ReconcileResult:
             enriched.append(r)
             continue
 
+        if cancel_fn():
+            raise OperationCancelled()
+
         checked += 1
         title, author, _, cover = r.book
-        isbn = get_isbn(title, author)
+        isbn = get_isbn(title, author, cancel_fn=cancel_fn)
         sleep_between_requests()
         if isbn:
             resolved += 1

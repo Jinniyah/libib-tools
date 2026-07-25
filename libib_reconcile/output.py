@@ -11,12 +11,13 @@ from __future__ import annotations
 import csv
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Optional, Protocol
 
 from lib import (
     LIBIB_HEADERS,
     EnrichmentResult,
+    OperationCancelled,
     classify_identifier,
     enrich_book,
     format_series_notes,
@@ -35,7 +36,9 @@ _NULL_ENRICHMENT = EnrichmentResult()
 # Same tag conventions as each scraper's own LIBIB_TYPE constant. Duplicated
 # here rather than imported from each scraper's core.py — the reconciler
 # shouldn't depend on scraper internals for a handful of static strings.
-_PROVIDER_TAGS: dict[str, str] = {
+# Public (not `_PROVIDER_TAGS`): libib_reconcile/review.py's finalize step
+# needs it too, for the tag-suggestions report.
+PROVIDER_TAGS: dict[str, str] = {
     "chirp": "chirp,audiobook",
     "kindle": "kindle,ebook",
     "kobo": "kobo,ebook",
@@ -49,8 +52,8 @@ def _output_path(directory: str, filename: str) -> str:
     return os.path.join(directory, filename)
 
 
-def _provider_tag(provider: str) -> str:
-    return _PROVIDER_TAGS.get(provider, provider)
+def provider_tag(provider: str) -> str:
+    return PROVIDER_TAGS.get(provider, provider)
 
 
 # ==========================
@@ -61,6 +64,7 @@ def _provider_tag(provider: str) -> str:
 def enrich_gap_books(
     gap_books: list[ScrapedBookResult],
     no_enrich: bool = False,
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> list[tuple[ScrapedBookResult, EnrichmentResult]]:
     """Run lib.enrich_book() over each gap book, same pattern as every
     scraper's own enrich_books() step. Skipped entirely if no_enrich."""
@@ -71,10 +75,18 @@ def enrich_gap_books(
     enriched: list[tuple[ScrapedBookResult, EnrichmentResult]] = []
 
     for idx, r in enumerate(gap_books, start=1):
+        if cancel_fn():
+            raise OperationCancelled()
+
         title, author, isbn, cover = r.book
         upc_isbn10, ean_isbn13 = classify_identifier(isbn) if isbn else ("", "")
         result = enrich_book(
-            title, author, ean_isbn13 or None, upc_isbn10 or None, cover
+            title,
+            author,
+            ean_isbn13 or None,
+            upc_isbn10 or None,
+            cover,
+            cancel_fn=cancel_fn,
         )
         sleep_between_requests()
 
@@ -111,7 +123,7 @@ def write_gap_csv(
             row["creators"] = author
             row["upc_isbn10"] = upc_isbn10
             row["ean_isbn13"] = ean_isbn13
-            row["tags"] = _provider_tag(scraped_result.provider)
+            row["tags"] = provider_tag(scraped_result.provider)
             row["description"] = enrichment.description or ""
             row["publisher"] = enrichment.publisher or ""
             row["publish_date"] = enrichment.publish_date or ""
@@ -213,6 +225,35 @@ def write_low_confidence_report(
                 f'[{m.confidence}] Libib: "{m.entry.title}" by {m.entry.creators}\n'
                 f'           Scraped ({m.provider}): "{scraped_title}" by {scraped_author}\n\n'
             )
+
+    return path
+
+
+def write_tag_suggestions_report(
+    suggestions: list[tuple[str, str, str]],
+    output_dir: str,
+    timestamp: str,
+) -> Optional[str]:
+    """One line per gap book a human confirmed is already in Libib, just
+    under a different/missing tag — `suggestions` is (provider, libib_title,
+    libib_creators), pre-resolved by libib_reconcile/review.py's finalize
+    step rather than this module depending on review.py's own data shapes.
+    These entries were deliberately excluded from the gap CSV (they're not
+    new books to import) — this is the other half of that decision: telling
+    the user exactly what manual Libib edit closes the loop. Never write
+    back to Libib directly, only ever report."""
+    if not suggestions:
+        return None
+
+    path = _output_path(output_dir, f"reconcile_{timestamp}_tag_suggestions.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            "Books confirmed already in Libib during review — add these "
+            "tags by hand\n"
+        )
+        f.write("=" * 44 + "\n\n")
+        for provider, title, creators in suggestions:
+            f.write(f"Add tag '{provider}' to: \"{title}\" by {creators}\n")
 
     return path
 

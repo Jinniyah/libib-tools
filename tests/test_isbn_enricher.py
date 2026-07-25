@@ -1,5 +1,8 @@
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
+import pytest
+
+from lib import OperationCancelled
 from libib_reconcile.isbn_enricher import enrich_missing_isbns
 from libib_reconcile.libib_reader import LibibEntry
 from libib_reconcile.reconciler import MatchResult, ReconcileResult, ScrapedBookResult
@@ -36,7 +39,7 @@ def test_resolves_missing_isbn(mock_get_isbn, mock_sleep):
     enriched = enrich_missing_isbns(result)
 
     assert enriched.scraped_results[0].book[2] == "9780593135204"
-    mock_get_isbn.assert_called_once_with("New Book", "New Author")
+    mock_get_isbn.assert_called_once_with("New Book", "New Author", cancel_fn=ANY)
     mock_sleep.assert_called_once()
 
 
@@ -127,3 +130,24 @@ def test_libib_results_pass_through_unchanged(mock_get_isbn, mock_sleep):
     enriched = enrich_missing_isbns(result)
 
     assert enriched.libib_results is libib_results
+
+
+@patch("libib_reconcile.isbn_enricher.sleep_between_requests")
+@patch("libib_reconcile.isbn_enricher.get_isbn")
+def test_raises_operation_cancelled_when_cancel_fn_flips(mock_get_isbn, mock_sleep):
+    result = ReconcileResult(
+        libib_results=[],
+        scraped_results=[
+            ScrapedBookResult(
+                "kindle", ("Book One", "Author", None, "cover"), "missing_from_libib"
+            ),
+            ScrapedBookResult(
+                "kobo", ("Book Two", "Author", None, "cover"), "missing_from_libib"
+            ),
+        ],
+    )
+
+    with pytest.raises(OperationCancelled):
+        enrich_missing_isbns(result, cancel_fn=lambda: True)
+
+    mock_get_isbn.assert_not_called()

@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block title %}Reconcile — LibibTools{% endblock %}
+
+{% block content %}
+<p><a href="/">&larr; Back to dashboard</a></p>
+<h1>Reconcile</h1>
+<p>Compare a Libib export against your provider scrapes, then review the
+  result interactively — a "gap" book found by a scrape but not matched to
+  Libib can still be confirmed as already-owned-but-mistagged by hand,
+  checkbook-register style, before anything gets marked as genuinely
+  missing.</p>
+
+<form id="reconcile-form">
+  <div class="field">
+    <label for="libib_path">Libib export CSV</label>
+    <input type="text" id="libib_path" name="libib_path" required
+           placeholder="C:\path\to\libib_library_export.csv">
+  </div>
+
+  <div class="field">
+    <label for="chirp">Chirp scrape CSV</label>
+    <input type="text" id="chirp" name="chirp" placeholder="Optional">
+  </div>
+
+  <div class="field">
+    <label for="kindle">Kindle scrape CSV</label>
+    <input type="text" id="kindle" name="kindle" placeholder="Optional">
+  </div>
+
+  <div class="field">
+    <label for="kobo">Kobo scrape CSV</label>
+    <input type="text" id="kobo" name="kobo" placeholder="Optional">
+  </div>
+
+  <div class="field">
+    <label for="nook">Nook scrape CSV</label>
+    <input type="text" id="nook" name="nook" placeholder="Optional">
+  </div>
+
+  <div class="field">
+    <label for="output_dir">Output directory</label>
+    <input type="text" id="output_dir" name="output_dir" value=".">
+  </div>
+
+  <div class="field field-checkbox">
+    <input type="checkbox" id="no_enrich" name="no_enrich">
+    <label for="no_enrich">Skip enrichment (faster, no extra HTTP calls)</label>
+  </div>
+
+  <button type="submit" class="btn" id="start-btn">Start reconcile</button>
+</form>
+
+<section id="job-panel" hidden>
+  <div class="status-row">
+    <h2>Status: <span id="job-status" class="badge">queued</span></h2>
+    <button type="button" class="btn btn-danger" id="cancel-btn">Cancel</button>
+  </div>
+
+  <div class="log-panel" id="log-panel"></div>
+
+  <div id="job-result" hidden>
+    <h2>Result</h2>
+    <p id="job-result-summary"></p>
+    <p id="job-review-link"></p>
+    <div id="job-downloads"></div>
+  </div>
+</section>
+
+<script src="{{ url_for('static', path='/app.js') }}"></script>
+<script>
+  initReconcilePage();
+</script>
+{% endblock %}

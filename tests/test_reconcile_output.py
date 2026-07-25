@@ -1,7 +1,7 @@
 import csv
 import os
 import tempfile
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from lib import LIBIB_HEADERS, EnrichmentResult
 
@@ -13,6 +13,7 @@ from libib_reconcile.output import (
     write_low_confidence_report,
     write_orphan_report,
     write_reconciliation_report,
+    write_tag_suggestions_report,
 )
 from libib_reconcile.reconciler import MatchResult, ReconcileResult, ScrapedBookResult
 
@@ -60,7 +61,9 @@ def test_enrich_gap_books_calls_enrich_book(mock_enrich_book, mock_sleep):
     enriched = enrich_gap_books(gap, no_enrich=False)
 
     assert enriched[0][1].description == "A description"
-    mock_enrich_book.assert_called_once_with("Title", "Author", None, None, "cover")
+    mock_enrich_book.assert_called_once_with(
+        "Title", "Author", None, None, "cover", cancel_fn=ANY
+    )
     mock_sleep.assert_called_once()
 
 
@@ -323,4 +326,25 @@ def test_write_ambiguous_report_content():
         with open(path, encoding="utf-8") as f:
             text = f.read()
     assert "Ambiguous Book" in text
-    assert "Ambiguous Author" in text
+
+
+# ==========================
+# write_tag_suggestions_report
+# ==========================
+
+
+def test_write_tag_suggestions_report_returns_none_when_empty():
+    with tempfile.TemporaryDirectory() as tmp:
+        assert write_tag_suggestions_report([], tmp, "2026-07-22_12-00") is None
+
+
+def test_write_tag_suggestions_report_content():
+    suggestions = [("nook", "Iron Widow", "Xiran Jay Zhao")]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write_tag_suggestions_report(suggestions, tmp, "2026-07-22_12-00")
+        assert path is not None
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    assert "nook" in text
+    assert "Iron Widow" in text
+    assert "Xiran Jay Zhao" in text

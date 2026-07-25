@@ -11,6 +11,7 @@ import argparse
 import csv
 import importlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -26,6 +27,7 @@ from libib_reconcile.output import (
     write_reconciliation_report,
 )
 from libib_reconcile.reconciler import ScrapedBook, reconcile
+from libib_reconcile.review import write_review_snapshot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,6 +60,7 @@ class ReconcileRunResult:
     ambiguous_path: Optional[str]
     total_libib_entries: int
     total_gap_books: int
+    review_snapshot_path: Optional[str] = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -176,6 +179,7 @@ def run(
     google: Optional[str] = None,
     dry_run: bool = False,
     no_enrich: bool = False,
+    cancel_fn: Callable[[], bool] = lambda: False,
 ) -> ReconcileRunResult:
     """Read the Libib export, reconcile against the selected provider scrapes,
     and write the gap CSV + reports. Callable directly (CLI, or a future GUI)
@@ -189,6 +193,11 @@ def run(
     `output_dir`, since that CSV is the data source reconciliation needs;
     there's no way to gather scrape data without it under the current
     scraper `run()` contract.
+
+    `cancel_fn` is checked inside `enrich_missing_isbns()` and
+    `enrich_gap_books()` — the two stages that make real per-book network
+    calls, same cooperative-cancel pattern as every scraper's own
+    `resolve_isbns()`/`enrich_books()`.
     """
     providers = providers if providers is not None else list(_PROVIDERS)
     existing_paths: dict[str, Optional[str]] = {
@@ -217,7 +226,7 @@ def run(
         len(scraped_books),
     )
     result = reconcile(libib_entries, scraped_books)
-    result = enrich_missing_isbns(result)
+    result = enrich_missing_isbns(result, cancel_fn=cancel_fn)
 
     gap_books = [r for r in result.scraped_results if r.status == "missing_from_libib"]
     log.info("Reconciliation complete: %d gap book(s) found.", len(gap_books))
@@ -239,7 +248,9 @@ def run(
     summary_path = write_reconciliation_report(result, output_dir, timestamp)
     log.info("Summary written: %s", summary_path)
 
-    enriched_gap_books = enrich_gap_books(gap_books, no_enrich=no_enrich)
+    enriched_gap_books = enrich_gap_books(
+        gap_books, no_enrich=no_enrich, cancel_fn=cancel_fn
+    )
     gap_csv_path = write_gap_csv(enriched_gap_books, output_dir, timestamp)
     log.info("Gap CSV written: %s", gap_csv_path)
 
@@ -255,6 +266,12 @@ def run(
     if ambiguous_path:
         log.info("Ambiguous report written: %s", ambiguous_path)
 
+    review_source_paths = {"libib": libib_path, **existing_paths}
+    review_snapshot_path = write_review_snapshot(
+        result, enriched_gap_books, review_source_paths, output_dir, timestamp
+    )
+    log.info("Review snapshot written: %s", review_snapshot_path)
+
     return ReconcileRunResult(
         gap_csv_path=gap_csv_path,
         summary_path=summary_path,
@@ -263,6 +280,7 @@ def run(
         ambiguous_path=ambiguous_path,
         total_libib_entries=len(libib_entries),
         total_gap_books=len(gap_books),
+        review_snapshot_path=review_snapshot_path,
     )
 
 
