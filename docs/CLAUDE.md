@@ -193,6 +193,20 @@ economically at multi-thousand-book scale. Open Library requests also now
 send an identifying `User-Agent` (`_OL_HEADERS`) — Open Library's own API
 docs cap unidentified requests at 1/s vs. 3/s for identified ones.
 
+**`wait_for_rate_limits` (2026-07-27)** — an opt-in escape hatch from both
+circuit breakers, threaded end-to-end from `core.run()`/the reconcile web
+form down to `enrich_book()`. Default `False` preserves the long-standing
+behavior (skip that source for a book hit during cooldown, log and move on
+— the right default for an unattended run). When `True`, `lib/openlibrary.py`'s
+`_await_ol_cooldown()` (shared by `_ol_query()` and
+`_fetch_open_library()`'s ISBN-edition lookup) and `lib/enricher.py`'s
+`_fetch_google_books_metadata()` sleep out the *remaining* cooldown instead
+of returning empty — slower, but nothing is left without metadata just
+because of unlucky timing, which a user explicitly asked for after watching
+books get silently skipped mid-run. The wait reuses `lib/http_retry.py`'s
+interruptible `_sleep()`, so a pending cancel still lands within ~1s instead
+of blocking for the full remaining cooldown.
+
 ---
 
 ## Scraper Architecture
@@ -370,6 +384,8 @@ def enrich_book(
     isbn13: str | None,
     isbn10: str | None,
     existing_notes: str,
+    cancel_fn: Callable[[], bool] | None = None,
+    wait_for_rate_limits: bool = False,
 ) -> EnrichmentResult: ...
 
 def format_series_notes(
@@ -597,7 +613,19 @@ def refresh_gap_enrichment(snapshot_path: str, gap_key: str) -> GapBookDict: ...
 def set_manual_enrichment(snapshot_path: str, gap_key: str, fields: dict) -> GapBookDict: ...
 
 def finalize_review(snapshot_path: str, output_dir: str) -> tuple[str, Optional[str]]: ...
+
+def list_review_snapshots(output_dir: str) -> list[SnapshotSummary]: ...
 ```
+`list_review_snapshots()` (2026-07-26) — resuming a review after a closed
+browser tab (or a server restart) with no way to remember the exact
+snapshot path. Scans `output_dir` for `reconcile_*_review_snapshot.json`
+files, newest first, each paired with a decided/total count; skips anything
+that fails to parse rather than breaking the whole listing. Wired as
+`GET /api/reconcile/review/snapshots`, surfaced as a "Resume an existing
+review" panel on `/reconcile` — point it at the same output directory and
+get a direct link back. Reads only from disk, so it works regardless of
+whether the job that produced the snapshot is still tracked by the
+in-memory job registry.
 `refresh_gap_enrichment()` (2026-07-24) — on-demand, single-book re-enrichment
 triggered by hand from the review page, for books that came out with little
 or no metadata (a `--no-enrich` run, or `enrich_book()`'s Open Library/Google
@@ -633,6 +661,35 @@ report). The candidate pool is every Libib entry regardless of match status
 (only `deleted`/`removed`-tagged entries excluded) — a real live bug
 (2026-07-25) found that excluding already-`matched` entries made a wrongly-
 or partially-matched entry unfindable and uncorrectable via search.
+
+Three decision statuses (2026-07-27 added the third): `"confirmed_match"`
+(already in Libib, needs a tag — excluded from the gap CSV, gets a tag
+suggestion), `"confirmed_new"` (genuinely missing — stays in the gap CSV
+for import), `"skipped"` (a library loan, short story, or anything else
+that was never meant to be in Libib at all — excluded from the gap CSV
+like a match, but with no tag suggestion, since there's no Libib entry to
+tag). Undecided (no `Decision` record at all) also stays in the gap CSV by
+default, same "never silently drop anything" rule.
+
+**Global skip list (2026-07-27)** — `reconcile_review_decisions.json` is
+deliberately scoped to one output directory, which doesn't help when each
+reconcile run uses a fresh dated output folder (the user's actual workflow):
+a skipped library loan would come back as an undecided gap every session.
+Fixed with a second, separate persistent file at a fixed path,
+`~/.config/libibtools/reconcile_skips.json` (`{gap_key: skipped_at}`,
+keyed by the same `stable_gap_key` content hash) — independent of any
+output directory, matching the (planned) Google Books credentials
+convention of a fixed app-config location. `review.py`'s `save_decision()`
+calls `_sync_global_skip()` after every write: a `"skipped"` status adds
+the gap key, any other status (including undoing a skip) removes it.
+`write_review_snapshot()` calls `_apply_global_skips_to_new_gaps()` right
+after writing a new snapshot, which pre-labels any gap book already in the
+global list as `"skipped"` in that session's own decisions file — without
+ever overwriting a decision that directory already has for that key. Tests
+that exercise either function (`test_reconcile_review.py`,
+`test_webapp_reconcile_review.py`, `test_reconcile_core.py`) each carry an
+autouse fixture redirecting `_GLOBAL_SKIP_LIST_PATH` to a temp file, so no
+test run ever touches the real path.
 
 **`libib_reader.py` public API** (complete):
 ```python
@@ -698,6 +755,29 @@ def reconcile(
    Libib entry's `creators` field, else `low`.
 3. Once a scraped book is consumed by any match, it's removed from further
    consideration — no double-booking one book across two Libib entries.
+
+**Title-containment matching for appended series/subtitle suffixes (real bug
+found and fixed, 2026-07-26):** Libib commonly stores a title as the real
+title plus appended series/subtitle text — "Veiled" → "Veiled (An Alex Verus
+Novel)", "Blood of the Mantis" → "Blood of the Mantis (Book #3 from the
+series: Shadows of the Apt)". `title_score()`'s plain `SequenceMatcher` ratio
+penalizes this proportional to how long the appended text is — confirmed
+with 7 real user-supplied pairs, 5 scored below the 0.55 auto-match
+threshold entirely. `reconciler.py` now has `_is_title_containment(a, b)` —
+true when one normalized (lowercased, punctuation-stripped) title fully
+contains the other, guarded so a single short word can't trigger it (shorter
+side must be >= 4 normalized characters). Used in two places:
+`title_score()` floors the score at 0.9 on a containment match (fixes
+ranking/display in the review page); `find_fuzzy_match()`'s plausibility gate
+accepts a containment match as an alternative to `_title_is_plausible()`, but
+**only when `author_overlap()` also holds** — containment alone is weaker
+than a high overall ratio (it can fire incidentally for a short/generic
+title), so it needs author corroboration before silently auto-matching,
+per explicit user request. `lib/openlibrary.py`'s `_title_is_plausible()`
+was deliberately left untouched (its own unidirectional substring check
+only helps when the *returned* title is the longer one, the opposite of
+this case) — the fix lives entirely in `reconciler.py` to avoid changing
+behavior for its original ISBN-lookup caller.
 
 **Tie-break must not depend on set iteration order (real bug found and fixed,
 Rec-5 preview, 2026-07-24):** `find_fuzzy_match()` builds its candidate list by
@@ -943,10 +1023,13 @@ no router-splitting yet, revisit if it gets unwieldy):
 | `GET /reconcile/jobs/{id}/events` | SSE log/status stream — literally `_job_event_stream`, no reconcile-specific code |
 | `GET /reconcile/jobs/{id}` | JSON job detail: status, error, `output_dir`, `review_snapshot_path`, download links |
 | `POST /reconcile/jobs/{id}/cancel` | Same cooperative-cancel pattern as scrape jobs |
+| `GET /api/reconcile/review/snapshots` | List existing review snapshots in a directory (`?dir=`), newest first, with decided/total counts — the "resume after closing the tab" discovery step |
 | `GET /reconcile/review` | The interactive checkbook-review page (`?snapshot=<path>`) |
 | `GET /api/reconcile/review/gaps` | Full gap list + current decision per item (small enough to return whole, filtered client-side) |
 | `GET /api/reconcile/review/candidates` | Ranked (default) or searched (`?q=`) candidate Libib entries for one gap book |
 | `POST /api/reconcile/review/decisions` | Upsert a human decision (`confirmed_match`/`confirmed_new`/`undecided`) — writes straight to `reconcile_review_decisions.json`, not through the job system at all |
+| `POST /api/reconcile/review/enrich` | On-demand single-book re-enrichment from Open Library/Google Books/AI/Wikidata |
+| `POST /api/reconcile/review/manual-enrichment` | Human-entered metadata for one gap book — sets exactly what's given, including an intentional blank |
 | `POST /reconcile/review/finalize` | Regenerate the reviewed gap CSV + tag-suggestions report from accumulated decisions |
 | `GET /reconcile/review/download` | Dedicated download route for finalize output — not job-scoped, since finalize output can be regenerated long after the originating Job (and its in-memory object) are gone, including across a server restart |
 | `GET /downloads/{job_id}/{filename}` | Serves a file — **only** if `filename` matches one of the job's own known result paths by basename; never joins user input onto a directory |
@@ -972,6 +1055,14 @@ regardless of which real module name string gets looked up.
 this Python-only test stack, and adding one (Node/Jest) for ~130 lines of
 vanilla JS would be disproportionate. The Python side it depends on (page
 route, job-detail endpoint, SSE status events) has full coverage.
+The candidate list on the review page (`renderCandidateList()` in `app.js`,
+2026-07-26) shows a "needs 'X' tag in Libib" hint per candidate — computed
+from `candidate.providers.includes(gap.provider)`, the same canonical
+(synonym-resolved) provider list `libib_reader.classify_providers()`
+produces, not raw `tags` — so the user can add the tag in Libib immediately
+while reviewing instead of needing a separate finalize → tag-report → Libib
+pass. Pure client-side rendering change; no new route or payload field.
+
 **Manually verified end-to-end, 2026-07-23:** the user ran all four scrapers
 for real through the GUI (real manual logins, real Continue clicks, real SSE
 log streaming) across several rounds of live bug reports — this is what

@@ -1,5 +1,12 @@
+from difflib import SequenceMatcher
+
 from libib_reconcile.libib_reader import LibibEntry
-from libib_reconcile.reconciler import _dedupe_scraped_books, reconcile
+from libib_reconcile.reconciler import (
+    _dedupe_scraped_books,
+    _is_title_containment,
+    reconcile,
+    title_score,
+)
 
 
 def _entry(
@@ -109,6 +116,41 @@ def test_fuzzy_match_low_confidence_missing_author():
     assert result.libib_results[0].confidence == "low"
 
 
+def test_fuzzy_match_finds_libib_title_with_appended_series_suffix():
+    """Real bug found live (2026-07-26): Libib titles that append series/
+    subtitle info ("Veiled" -> "Veiled (An Alex Verus Novel)", "Blood of the
+    Mantis" -> "Blood of the Mantis (Book #3 from the series: Shadows of the
+    Apt)") scored well below the plain ratio threshold — the longer the
+    appended text, the lower the ratio, regardless of it being the same
+    book. Confirmed the author still corroborates before accepting this
+    weaker containment-only signal."""
+    entry = _entry(
+        "Veiled (An Alex Verus Novel)", "Benedict Jacka", providers={"kindle"}
+    )
+    scraped = {"kindle": [("Veiled", "Benedict Jacka", None, "cover")]}
+
+    result = reconcile([entry], scraped)
+
+    match = result.libib_results[0]
+    assert match.status == "matched"
+    assert match.confidence == "medium"
+    assert match.method == "fuzzy_title_author"
+
+
+def test_fuzzy_match_series_suffix_requires_author_corroboration():
+    """Title containment alone isn't enough — unlike a strong overall
+    ratio, it's a weaker signal that can occur incidentally, so it only
+    counts as plausible when the author also overlaps."""
+    entry = _entry(
+        "Veiled (An Alex Verus Novel)", "Benedict Jacka", providers={"kindle"}
+    )
+    scraped = {"kindle": [("Veiled", "A Completely Different Author", None, "cover")]}
+
+    result = reconcile([entry], scraped)
+
+    assert result.libib_results[0].status == "libib_only"
+
+
 def test_fuzzy_match_scoped_to_tagged_providers():
     """Even a great fuzzy candidate in an untagged provider's pool must not match."""
     entry = _entry("The Fifth Season", "N.K. Jemisin", providers={"kindle"})
@@ -191,6 +233,66 @@ def test_cross_format_entry_matches_either_scrape():
 
     assert result.libib_results[0].status == "matched"
     assert result.libib_results[0].provider == "nook"
+
+
+# ==========================
+# Title containment (series/subtitle suffixes)
+# ==========================
+
+
+def test_title_containment_detects_appended_series_suffix():
+    assert _is_title_containment(
+        "Blood of the Mantis",
+        "Blood of the Mantis (Book #3 from the series: Shadows of the Apt)",
+    )
+
+
+def test_title_containment_is_direction_independent():
+    """Whichever side happens to carry the extra series/subtitle text,
+    containment must still be detected — real callers pass (Libib title,
+    scraped title) with Libib on the query side, so the longer string is
+    usually first, not second."""
+    assert _is_title_containment(
+        "Vision In Silver: A Novel of the Others", "Vision in Silver"
+    )
+    assert _is_title_containment(
+        "Vision in Silver", "Vision In Silver: A Novel of the Others"
+    )
+
+
+def test_title_containment_false_for_unrelated_titles():
+    assert not _is_title_containment("Veiled", "Completely Different Book")
+
+
+def test_title_containment_ignores_single_word_coincidences():
+    """A guard against one very short title trivially appearing inside an
+    unrelated longer one — requires the shorter side to be non-trivial."""
+    assert not _is_title_containment("At", "Cat on a Hot Tin Roof")
+
+
+def test_title_score_boosts_containment_matches_above_raw_ratio():
+    """Without the boost, a long appended series suffix drags the raw
+    SequenceMatcher ratio down proportional to its own length — real case
+    (2026-07-26): "Veiled" vs "Veiled (An Alex Verus Novel)" scores ~0.35 on
+    ratio alone despite being the same book."""
+    raw_ratio = SequenceMatcher(
+        None, "veiled".lower(), "veiled (an alex verus novel)".lower()
+    ).ratio()
+    boosted = title_score("Veiled", "Veiled (An Alex Verus Novel)")
+
+    assert raw_ratio < 0.55
+    assert boosted >= 0.9
+    assert boosted > raw_ratio
+
+
+def test_title_score_leaves_non_containment_scores_unchanged():
+    score = title_score("Dune", "Completely Unrelated Title")
+    assert (
+        score
+        == SequenceMatcher(
+            None, "dune".lower(), "completely unrelated title".lower()
+        ).ratio()
+    )
 
 
 # ==========================

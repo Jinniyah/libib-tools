@@ -149,6 +149,22 @@ def test_fetch_open_library_skips_call_entirely_while_in_cooldown(mock_get):
 
 @patch("lib.enricher._ol_query")
 @patch("lib.enricher._http_get_json")
+def test_fetch_open_library_waits_out_cooldown_when_opted_in(mock_get, mock_search):
+    mock_get.return_value = None
+    mock_search.return_value = []
+    _trip_ol_circuit_breaker()
+
+    with patch("lib.http_retry.time.sleep") as mock_sleep:
+        _fetch_open_library(
+            "9781234567897", "Title", "Author", wait_for_rate_limits=True
+        )
+
+    mock_sleep.assert_called()
+    mock_get.assert_called_once()
+
+
+@patch("lib.enricher._ol_query")
+@patch("lib.enricher._http_get_json")
 def test_fetch_open_library_title_fallback(mock_get, mock_search):
     mock_get.return_value = None
     mock_search.return_value = [
@@ -269,6 +285,18 @@ def test_fetch_google_books_skips_call_entirely_while_in_cooldown(mock_get):
 
 
 @patch("lib.enricher._http_get_json")
+def test_fetch_google_books_waits_out_cooldown_when_opted_in(mock_get):
+    mock_get.return_value = {"items": []}
+    _trip_google_books_circuit_breaker()
+
+    with patch("lib.http_retry.time.sleep") as mock_sleep:
+        _fetch_google_books_metadata(None, "Title", "Author", wait_for_rate_limits=True)
+
+    mock_sleep.assert_called()
+    mock_get.assert_called_once()
+
+
+@patch("lib.enricher._http_get_json")
 def test_fetch_google_books_resumes_after_cooldown_expires(mock_get):
     mock_get.return_value = {"items": []}
 
@@ -305,6 +333,21 @@ def test_enrich_book_open_library_full_hit(mock_ol, mock_gb, mock_wd):
     assert result.isbn13 == "9781234567897"
     assert result.isbn10 == "1234567890"
     mock_gb.assert_not_called()
+
+
+@patch("lib.enricher._fetch_wikidata_series", return_value=(None, None))
+@patch("lib.enricher._fetch_google_books_metadata")
+@patch("lib.enricher._fetch_open_library")
+def test_enrich_book_threads_wait_for_rate_limits_into_both_fetchers(
+    mock_ol, mock_gb, mock_wd
+):
+    mock_ol.return_value = {}
+    mock_gb.return_value = {}
+
+    enrich_book("Title", "Author", None, None, "cover", wait_for_rate_limits=True)
+
+    assert mock_ol.call_args.kwargs["wait_for_rate_limits"] is True
+    assert mock_gb.call_args.kwargs["wait_for_rate_limits"] is True
 
 
 @patch("lib.enricher._fetch_wikidata_series", return_value=(None, None))

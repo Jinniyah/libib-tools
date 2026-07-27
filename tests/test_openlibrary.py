@@ -3,6 +3,7 @@ from unittest.mock import patch
 import pytest
 
 import lib.openlibrary as openlibrary_module
+from lib.cancellation import OperationCancelled
 from lib.openlibrary import (
     _normalize_isbn,
     _valid_isbn10,
@@ -173,6 +174,40 @@ def test_ol_query_resumes_after_cooldown_expires(mock_get):
 
     assert docs == [{"title": "Test"}]
     mock_get.assert_called_once()
+
+
+@patch("lib.http_retry.requests.get")
+def test_ol_query_waits_out_cooldown_instead_of_skipping_when_opted_in(mock_get):
+    """wait_for_rate_limits=True (opt-in, since most runs are unattended):
+    instead of skipping the request outright, wait out the remaining
+    cooldown and then make the call for real."""
+    mock_get.return_value.json.return_value = {"docs": [{"title": "Test"}]}
+    mock_get.return_value.raise_for_status = lambda: None
+    _trip_ol_circuit_breaker()
+
+    with patch("lib.http_retry.time.sleep") as mock_sleep:
+        docs = _ol_query({"title": "Test"}, "Test", wait_for_rate_limits=True)
+
+    assert docs == [{"title": "Test"}]
+    mock_get.assert_called_once()
+    mock_sleep.assert_called()
+
+
+@patch("lib.http_retry.requests.get")
+def test_ol_query_wait_is_interruptible_by_cancel_fn(mock_get):
+    """The wait must still be cooperatively cancellable — a pending cancel
+    should raise rather than block for the full remaining cooldown."""
+    _trip_ol_circuit_breaker()
+
+    with pytest.raises(OperationCancelled):
+        _ol_query(
+            {"title": "Test"},
+            "Test",
+            cancel_fn=lambda: True,
+            wait_for_rate_limits=True,
+        )
+
+    mock_get.assert_not_called()
 
 
 def test_filter_invalid_books_records_dropped_entries_for_human_review():

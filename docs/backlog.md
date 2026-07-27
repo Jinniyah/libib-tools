@@ -1038,6 +1038,126 @@ real benefit here.
      to protect against) — plus `POST /api/reconcile/review/manual-enrichment`
      and editable description/publisher/publish-date/page-count/series
      fields directly in the review page, pre-filled with current values.
+- [x] **Follow-up: resuming after a closed tab.** A real gap found live
+  (2026-07-26): the snapshot and decisions file were already durable on
+  disk by design, but there was no way back to them without the exact
+  snapshot file path — closing the browser tab (or restarting the server)
+  meant losing that path entirely, even though nothing was actually lost.
+  Added `review.list_review_snapshots(output_dir)` — scans a directory for
+  `reconcile_*_review_snapshot.json` files, newest first, pairing each with
+  its decided/total count (skips unparseable files rather than failing the
+  whole listing) — wired as `GET /api/reconcile/review/snapshots` and a
+  "Resume an existing review" panel on the `/reconcile` page: point it at
+  the output directory you used before and get a direct link back in.
+  Works whether or not the server has restarted since, since it only reads
+  from disk, never the in-memory job registry.
+- [x] **Follow-up: show the missing tag right in the candidate list
+  (2026-07-26).** User feedback: confirming a match today only means "don't
+  export this as a gap" — the user still has to separately open the
+  finalize-time tag-suggestions report and go back to Libib to actually add
+  the provider tag, after already having the exact right Libib entry open in
+  front of them mid-review. Purely a client-side change: `renderCandidateList()`
+  in `webapp/static/app.js` now computes, per candidate,
+  `candidate.providers.includes(gap.provider)` — deliberately the
+  already-resolved `providers` list, not raw `tags`, so a synonym tag like
+  `bn` (which resolves to `nook`) doesn't get wrongly flagged as missing —
+  and shows a "Needs the "X" tag in Libib" hint under any candidate that's
+  missing the current gap book's provider tag, plus the same reminder worked
+  into the "Confirm match" button text itself. No backend/API change —
+  `providers` and `gap.provider` were already present in the existing
+  `/api/reconcile/review/candidates` and `/api/reconcile/review/gaps`
+  payloads, just not surfaced in the UI.
+- [x] **Follow-up: titles with an appended series/subtitle suffix scored too
+  low to match (2026-07-26).** Real bug, found from user-supplied examples
+  while live-reviewing a gap list — Libib often stores a title as the real
+  title plus appended series/subtitle text ("Veiled" → "Veiled (An Alex
+  Verus Novel)", "Blood of the Mantis" → "Blood of the Mantis (Book #3 from
+  the series: Shadows of the Apt)", "Mermaids and Meringue" → "... - Book 3
+  of Sugar Shack Witch Mysteries", plus 4 more confirmed examples, all same
+  shape). `title_score()`'s raw `SequenceMatcher` ratio penalizes this
+  proportional to how long the appended text is — of 7 real confirmed pairs,
+  5 scored below the automated matcher's 0.55 threshold entirely (as low as
+  0.35 for the "Veiled" case), meaning these were forced into manual review
+  instead of auto-matching, and even in manual review the ranked candidate
+  list showed a misleadingly low match percentage. Fixed with a new
+  `_is_title_containment()` check (one normalized title fully contains the
+  other, guarded against single-word coincidences) used two ways: (1)
+  `title_score()` now floors the score at 0.9 for a containment match, so
+  ranking/display reflects it's actually a strong match; (2)
+  `find_fuzzy_match()`'s plausibility gate now also accepts a containment
+  match, but — per explicit user request ("can you check the author as well
+  for these") — **only when the author also overlaps**, since containment
+  alone is a weaker signal than a high overall ratio and could fire
+  incidentally for a short/generic title. 8 new tests in
+  `tests/test_reconcile.py` cover the containment helper directly (including
+  direction-independence — real callers pass the Libib title, which usually
+  carries the suffix, first) and the full matched/not-matched behavior
+  through `reconcile()`.
+- [x] **Follow-up: option to wait out rate-limit cooldowns instead of
+  skipping (2026-07-27).** User feedback while running a real reconcile:
+  when the Open Library/Google Books circuit breaker trips, subsequent
+  books in cooldown were silently skipped for that source, leaving them
+  with less metadata — acceptable for an unattended run, but the user
+  explicitly wanted the option to wait instead when they're not in a hurry,
+  so nothing gets left incomplete just because of unlucky timing. Added an
+  opt-in `wait_for_rate_limits` flag (default `False`, preserving the
+  long-standing skip behavior) threaded end-to-end: `lib/openlibrary.py`
+  gained `_await_ol_cooldown()` (shared by `_ol_query()` and
+  `_fetch_open_library()`'s ISBN-edition path) which sleeps out the
+  remaining cooldown instead of returning empty when opted in — the wait
+  is interruptible, so a cancel still lands within ~1s instead of blocking
+  for the full remaining cooldown; `lib/enricher.py`'s
+  `_fetch_google_books_metadata()` got the equivalent for its own circuit
+  breaker. Threaded through `enrich_book()` → `enrich_gap_books()` →
+  `enrich_missing_isbns()`'s `get_isbn()` calls → `core.run()` → new
+  `--wait-for-rate-limits` CLI flag and a `wait_for_rate_limits` field on
+  the webapp's `ReconcileOptions` + a checkbox on the reconcile run form.
+  9 new tests across `test_openlibrary.py`, `test_enricher.py`,
+  `test_isbn_enricher.py`, `test_reconcile_output.py`,
+  `test_reconcile_core.py`, and `test_webapp_reconcile_dispatch.py`.
+- [x] **Follow-up: a "skip" decision for books that genuinely don't belong
+  in Libib (2026-07-27).** User feedback while reviewing real gap books:
+  some scraped titles are library loans or short stories that were never
+  meant to be cataloged in Libib at all — distinct from both
+  "confirmed_match" (it's already in Libib, just needs a tag) and
+  "confirmed_new" (it's genuinely missing and should be imported). Neither
+  existing decision covered "don't import this, and don't suggest a tag for
+  it either." Added a third decision status, `"skipped"`, alongside a
+  "Skip — not needed in Libib (loan, short story, etc.)" button next to
+  "None of these" on the review page. `finalize_review()` now excludes
+  `skipped` gap books from the reviewed gap CSV exactly like
+  `confirmed_match` does, but — unlike a match — generates no tag
+  suggestion, since there's no Libib entry to tag. No backend route changes
+  needed (`POST /api/reconcile/review/decisions` already accepted any
+  status string); one new regression test in `test_reconcile_review.py`
+  confirms the CSV-exclusion + no-tag-suggestion behavior together.
+- [x] **Follow-up: remember skips across sessions, not just within one
+  output directory (2026-07-27).** User feedback: since each reconcile run
+  tends to use a fresh, dated output directory, a "skipped" decision only
+  helped within that one session — the same library loan or short story
+  would show up as an undecided gap again next time, needing to be
+  re-skipped by hand every session. `reconcile_review_decisions.json` is
+  deliberately scoped to one output directory, so it couldn't be the fix
+  directly. Asked the user where a cross-session record should live (next
+  to the Libib export, a fixed app-config path, or an explicit new field
+  each run); chose a fixed app-config path, matching the (planned) Google
+  Books credentials convention. Added a new persistent file,
+  `~/.config/libibtools/reconcile_skips.json` — a plain `{gap_key:
+  skipped_at}` map, keyed by the same content-hash `stable_gap_key` used
+  everywhere else, so it naturally matches the same book if it's re-scraped
+  identically later. `save_decision()` now keeps this file in sync
+  (`_sync_global_skip()`): a `"skipped"` decision adds to it, any other
+  status (including undoing a skip) removes from it. `write_review_snapshot()`
+  now calls a new `_apply_global_skips_to_new_gaps()` right after writing a
+  fresh snapshot — pre-labels any gap book whose key is already in the
+  global list as `"skipped"` in that session's own (otherwise-empty)
+  decisions file, without ever overwriting a decision already made in that
+  directory. Added a field-hint on the review page explaining the
+  behavior. 6 new tests in `test_reconcile_review.py`; the two other test
+  files that exercise `write_review_snapshot()`/`save_decision()`
+  (`test_webapp_reconcile_review.py`, `test_reconcile_core.py`) each gained
+  an autouse fixture redirecting the global skip path to a temp file, so
+  no test ever touches the developer's real `~/.config/libibtools/`.
 
 ### GUI log visibility — root logger level bug — COMPLETE (2026-07-23)
 Found while chasing a user report of "no feedback at all" during a Kobo run

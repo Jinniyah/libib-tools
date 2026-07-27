@@ -16,10 +16,9 @@ import requests
 from lib.http_retry import request_json
 from lib.http_retry import _sleep as _interruptible_sleep
 from lib.openlibrary import (
+    _await_ol_cooldown,
     _best_isbn,
-    _ol_cooldown_remaining,
     _OL_HEADERS,
-    _ol_in_cooldown,
     _ol_query,
     _title_is_plausible,
     _trip_ol_circuit_breaker,
@@ -183,15 +182,10 @@ def _fetch_open_library(
     title: str,
     author: str,
     cancel_fn: Optional[Callable[[], bool]] = None,
+    wait_for_rate_limits: bool = False,
 ) -> dict:
     """Fetch description/publisher/publish_date/length_of/ISBNs from Open Library."""
-    if _ol_in_cooldown():
-        log.info(
-            "Skipping Open Library for '%s' — still cooling down after "
-            "repeated errors (%.0fs left).",
-            title,
-            _ol_cooldown_remaining(),
-        )
+    if not _await_ol_cooldown(title, cancel_fn, wait_for_rate_limits):
         return {}
 
     result: dict = {}
@@ -232,7 +226,12 @@ def _fetch_open_library(
         }
         if author:
             params["author"] = author
-        docs = _ol_query(params, title, cancel_fn=cancel_fn)
+        docs = _ol_query(
+            params,
+            title,
+            cancel_fn=cancel_fn,
+            wait_for_rate_limits=wait_for_rate_limits,
+        )
         for doc in docs:
             if not _title_is_plausible(title, doc.get("title", "")):
                 continue
@@ -281,16 +280,27 @@ def _fetch_google_books_metadata(
     title: str,
     author: str,
     cancel_fn: Optional[Callable[[], bool]] = None,
+    wait_for_rate_limits: bool = False,
 ) -> dict:
     """Fetch metadata from the public (no-auth) Google Books volumes endpoint."""
     if _google_books_in_cooldown():
-        log.info(
-            "Skipping Google Books for '%s' — still cooling down after a rate "
-            "limit (%.0fs left).",
-            title,
-            _google_books_blocked_until - time.time(),
-        )
-        return {}
+        remaining = _google_books_blocked_until - time.time()
+        if wait_for_rate_limits:
+            log.info(
+                "Google Books is cooling down for '%s' (%.0fs left) — "
+                "waiting instead of skipping.",
+                title,
+                remaining,
+            )
+            _interruptible_sleep(remaining, cancel_fn)
+        else:
+            log.info(
+                "Skipping Google Books for '%s' — still cooling down after a "
+                "rate limit (%.0fs left).",
+                title,
+                remaining,
+            )
+            return {}
 
     if isbn13:
         query = f"isbn:{isbn13}"
@@ -521,15 +531,36 @@ def enrich_book(
     isbn10: Optional[str],
     existing_notes: str,
     cancel_fn: Optional[Callable[[], bool]] = None,
+    wait_for_rate_limits: bool = False,
 ) -> EnrichmentResult:
-    """Orchestrate Open Library -> Google Books -> AI fallback -> Wikidata series."""
-    ol = _fetch_open_library(isbn13, title, author, cancel_fn=cancel_fn)
+    """Orchestrate Open Library -> Google Books -> AI fallback -> Wikidata series.
+
+    `wait_for_rate_limits` opts into waiting out a tripped circuit breaker's
+    cooldown (see lib.openlibrary._await_ol_cooldown /
+    _google_books_in_cooldown) instead of skipping that source for this book
+    — slower overall, but captures metadata this book would otherwise be
+    left without. Default False preserves the long-standing skip-and-move-on
+    behavior, which is the better default for an unattended run.
+    """
+    ol = _fetch_open_library(
+        isbn13,
+        title,
+        author,
+        cancel_fn=cancel_fn,
+        wait_for_rate_limits=wait_for_rate_limits,
+    )
     sleep_between_requests()
 
     missing = [f for f in _METADATA_FIELDS if not ol.get(f)]
     gb: dict = {}
     if missing:
-        gb = _fetch_google_books_metadata(isbn13, title, author, cancel_fn=cancel_fn)
+        gb = _fetch_google_books_metadata(
+            isbn13,
+            title,
+            author,
+            cancel_fn=cancel_fn,
+            wait_for_rate_limits=wait_for_rate_limits,
+        )
         _sleep_after_google_books(cancel_fn=cancel_fn)
 
     ai: dict = {}

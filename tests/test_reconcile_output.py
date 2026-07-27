@@ -62,9 +62,32 @@ def test_enrich_gap_books_calls_enrich_book(mock_enrich_book, mock_sleep):
 
     assert enriched[0][1].description == "A description"
     mock_enrich_book.assert_called_once_with(
-        "Title", "Author", None, None, "cover", cancel_fn=ANY
+        "Title",
+        "Author",
+        None,
+        None,
+        "cover",
+        cancel_fn=ANY,
+        wait_for_rate_limits=False,
     )
     mock_sleep.assert_called_once()
+
+
+@patch("libib_reconcile.output.sleep_between_requests")
+@patch("libib_reconcile.output.enrich_book")
+def test_enrich_gap_books_threads_wait_for_rate_limits(mock_enrich_book, mock_sleep):
+    mock_enrich_book.return_value = EMPTY
+    gap = [
+        ScrapedBookResult(
+            "kindle", ("Title", "Author", None, "cover"), "missing_from_libib"
+        )
+    ]
+
+    enrich_gap_books(gap, no_enrich=False, wait_for_rate_limits=True)
+
+    mock_enrich_book.assert_called_once_with(
+        "Title", "Author", None, None, "cover", cancel_fn=ANY, wait_for_rate_limits=True
+    )
 
 
 # ==========================

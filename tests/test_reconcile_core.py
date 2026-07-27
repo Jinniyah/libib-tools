@@ -5,6 +5,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+import libib_reconcile.review as review_module
 from lib import LIBIB_HEADERS
 from libib_reconcile.core import (
     ReconcileRunResult,
@@ -16,6 +17,16 @@ from libib_reconcile.core import (
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 LIBIB_EXPORT_FIXTURE = os.path.join(FIXTURES, "libib_export_sample.csv")
 KINDLE_SCRAPE_FIXTURE = os.path.join(FIXTURES, "scrape_kindle_sample.csv")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_global_skip_list(tmp_path, monkeypatch):
+    """run() writes a real review snapshot in several tests here, which
+    touches the global skip list (see libib_reconcile/review.py) — redirect
+    it to a throwaway path so tests never read the developer's real one."""
+    monkeypatch.setattr(
+        review_module, "_GLOBAL_SKIP_LIST_PATH", str(tmp_path / "reconcile_skips.json")
+    )
 
 
 # ==========================
@@ -36,6 +47,7 @@ def test_cli_libib_and_defaults():
     assert args.scrape is False
     assert args.dry_run is False
     assert args.no_enrich is False
+    assert args.wait_for_rate_limits is False
     assert args.output_dir == "."
     assert set(args.providers) == {"chirp", "kindle", "kobo", "nook", "google"}
 
@@ -74,6 +86,12 @@ def test_cli_scrape_and_no_enrich_flags():
         args = parse_args()
     assert args.scrape is True
     assert args.no_enrich is True
+
+
+def test_cli_wait_for_rate_limits_flag():
+    with patch("sys.argv", ["prog", "--libib", "export.csv", "--wait-for-rate-limits"]):
+        args = parse_args()
+    assert args.wait_for_rate_limits is True
 
 
 # ==========================
@@ -281,7 +299,9 @@ def test_run_dry_run_has_no_review_snapshot_path():
 def test_run_threads_cancel_fn_into_both_enrichment_stages(
     mock_enrich_missing_isbns, mock_enrich_gap_books
 ):
-    mock_enrich_missing_isbns.side_effect = lambda result, cancel_fn: result
+    mock_enrich_missing_isbns.side_effect = (
+        lambda result, cancel_fn, wait_for_rate_limits: result
+    )
     mock_enrich_gap_books.return_value = []
 
     def my_cancel_fn() -> bool:
@@ -295,7 +315,9 @@ def test_run_threads_cancel_fn_into_both_enrichment_stages(
             cancel_fn=my_cancel_fn,
         )
 
-    mock_enrich_missing_isbns.assert_called_once_with(ANY, cancel_fn=my_cancel_fn)
+    mock_enrich_missing_isbns.assert_called_once_with(
+        ANY, cancel_fn=my_cancel_fn, wait_for_rate_limits=False
+    )
     mock_enrich_gap_books.assert_called_once_with(
-        ANY, no_enrich=False, cancel_fn=my_cancel_fn
+        ANY, no_enrich=False, cancel_fn=my_cancel_fn, wait_for_rate_limits=False
     )

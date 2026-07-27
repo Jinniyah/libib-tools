@@ -11,6 +11,20 @@
   checkbook-register style, before anything gets marked as genuinely
   missing.</p>
 
+<section class="card" id="resume-panel" style="margin-bottom: var(--space-4);">
+  <h2>Resume an existing review</h2>
+  <p class="field-hint">Already ran a reconcile and closed the tab (or
+    restarted the server)? Your progress is safe on disk — point this at the
+    same output directory to get a link straight back to it.</p>
+  <div class="field">
+    <label for="resume-dir">Output directory</label>
+    <input type="text" id="resume-dir" placeholder="Same folder you used before">
+  </div>
+  <button type="button" class="btn btn-secondary" id="find-reviews-btn">Find reviews</button>
+  <p id="resume-status" class="field-hint"></p>
+  <ul id="resume-list" class="review-list"></ul>
+</section>
+
 <form id="reconcile-form">
   <div class="field">
     <label for="libib_path">Libib export CSV</label>
@@ -48,6 +62,12 @@
     <label for="no_enrich">Skip enrichment (faster, no extra HTTP calls)</label>
   </div>
 
+  <div class="field field-checkbox">
+    <input type="checkbox" id="wait_for_rate_limits" name="wait_for_rate_limits">
+    <label for="wait_for_rate_limits">Wait out rate-limit cooldowns instead of
+      skipping (slower, but nothing gets left without metadata)</label>
+  </div>
+
   <button type="submit" class="btn" id="start-btn">Start reconcile</button>
 </form>
 
@@ -67,7 +87,7 @@
   </div>
 </section>
 
-<script src="{{ url_for('static', path='/app.js') }}"></script>
+<script src="{{ url_for('static', path='/app.js') }}?v={{ asset_version }}"></script>
 <script>
   initReconcilePage();
 </script>

@@ -82,6 +82,12 @@
       <button type="button" class="btn btn-secondary" id="confirm-new-btn">
         None of these — confirm as genuinely new
       </button>
+      <button type="button" class="btn btn-secondary" id="skip-btn">
+        Skip — not needed in Libib (loan, short story, etc.)
+      </button>
+      <p class="field-hint">Skipped books are remembered permanently — the
+        same book will already show up pre-skipped next time, even in a
+        brand-new output directory, so you never have to re-decide it.</p>
     </div>
   </section>
 </div>
@@ -100,7 +106,7 @@
   where you left off by reopening this same URL later.
 </p>
 
-<script src="{{ url_for('static', path='/app.js') }}"></script>
+<script src="{{ url_for('static', path='/app.js') }}?v={{ asset_version }}"></script>
 <script>
   initReconcileReviewPage();
 </script>

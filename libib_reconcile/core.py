@@ -96,6 +96,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip metadata/series enrichment on the gap CSV (faster, no extra HTTP calls).",
     )
+    parser.add_argument(
+        "--wait-for-rate-limits",
+        action="store_true",
+        help="Wait out an Open Library/Google Books rate-limit cooldown instead of "
+        "skipping that source for books hit during it — slower, but nothing is "
+        "left without metadata just because of unlucky timing.",
+    )
     return parser.parse_args()
 
 
@@ -179,6 +186,7 @@ def run(
     google: Optional[str] = None,
     dry_run: bool = False,
     no_enrich: bool = False,
+    wait_for_rate_limits: bool = False,
     cancel_fn: Callable[[], bool] = lambda: False,
 ) -> ReconcileRunResult:
     """Read the Libib export, reconcile against the selected provider scrapes,
@@ -193,6 +201,10 @@ def run(
     `output_dir`, since that CSV is the data source reconciliation needs;
     there's no way to gather scrape data without it under the current
     scraper `run()` contract.
+
+    `wait_for_rate_limits` is passed straight through to `enrich_missing_isbns()`
+    and `enrich_gap_books()` — opts into waiting out an Open Library/Google
+    Books cooldown instead of skipping that source for books hit during it.
 
     `cancel_fn` is checked inside `enrich_missing_isbns()` and
     `enrich_gap_books()` — the two stages that make real per-book network
@@ -226,7 +238,9 @@ def run(
         len(scraped_books),
     )
     result = reconcile(libib_entries, scraped_books)
-    result = enrich_missing_isbns(result, cancel_fn=cancel_fn)
+    result = enrich_missing_isbns(
+        result, cancel_fn=cancel_fn, wait_for_rate_limits=wait_for_rate_limits
+    )
 
     gap_books = [r for r in result.scraped_results if r.status == "missing_from_libib"]
     log.info("Reconciliation complete: %d gap book(s) found.", len(gap_books))
@@ -249,7 +263,10 @@ def run(
     log.info("Summary written: %s", summary_path)
 
     enriched_gap_books = enrich_gap_books(
-        gap_books, no_enrich=no_enrich, cancel_fn=cancel_fn
+        gap_books,
+        no_enrich=no_enrich,
+        cancel_fn=cancel_fn,
+        wait_for_rate_limits=wait_for_rate_limits,
     )
     gap_csv_path = write_gap_csv(enriched_gap_books, output_dir, timestamp)
     log.info("Gap CSV written: %s", gap_csv_path)
@@ -300,6 +317,7 @@ def main() -> None:
             google=args.google,
             dry_run=args.dry_run,
             no_enrich=args.no_enrich,
+            wait_for_rate_limits=args.wait_for_rate_limits,
         )
     except ValueError as exc:
         raise SystemExit(str(exc))

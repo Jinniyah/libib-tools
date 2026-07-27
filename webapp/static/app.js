@@ -239,6 +239,7 @@ function initReconcilePage() {
       nook: formData.get("nook") || null,
       output_dir: formData.get("output_dir") || ".",
       no_enrich: formData.get("no_enrich") === "on",
+      wait_for_rate_limits: formData.get("wait_for_rate_limits") === "on",
     };
 
     let response;
@@ -285,6 +286,53 @@ function initReconcilePage() {
     cancelBtn.disabled = true;
     await fetch(jobUrl("/cancel"), { method: "POST" });
   });
+
+  const resumeDirInput = document.getElementById("resume-dir");
+  const findReviewsBtn = document.getElementById("find-reviews-btn");
+  const resumeStatusEl = document.getElementById("resume-status");
+  const resumeListEl = document.getElementById("resume-list");
+  const outputDirInput = document.getElementById("output_dir");
+
+  findReviewsBtn.addEventListener("click", async () => {
+    const dir = resumeDirInput.value.trim() || outputDirInput.value.trim() || ".";
+    resumeListEl.innerHTML = "";
+    resumeStatusEl.textContent = "Looking…";
+
+    let data;
+    try {
+      const response = await fetch(
+        "/api/reconcile/review/snapshots?dir=" + encodeURIComponent(dir)
+      );
+      data = await response.json();
+    } catch (err) {
+      resumeStatusEl.textContent = "Error checking that folder: " + err;
+      return;
+    }
+
+    if (data.snapshots.length === 0) {
+      resumeStatusEl.textContent = "No existing reviews found in that folder.";
+      return;
+    }
+
+    resumeStatusEl.textContent = "";
+    data.snapshots.forEach((s) => {
+      const li = document.createElement("li");
+      li.className = "review-row";
+
+      const info = document.createElement("span");
+      info.textContent =
+        s.generated_at + " — " + s.decided_count + " / " + s.gap_count + " reviewed";
+      li.appendChild(info);
+
+      const link = document.createElement("a");
+      link.href = "/reconcile/review?snapshot=" + encodeURIComponent(s.path);
+      link.className = "btn btn-secondary";
+      link.textContent = "Resume";
+      li.appendChild(link);
+
+      resumeListEl.appendChild(li);
+    });
+  });
 }
 
 function initReconcileReviewPage() {
@@ -304,6 +352,7 @@ function initReconcileReviewPage() {
   const candidateSearchHint = document.getElementById("candidate-search-hint");
   const candidateListEl = document.getElementById("candidate-list");
   const confirmNewBtn = document.getElementById("confirm-new-btn");
+  const skipBtn = document.getElementById("skip-btn");
   const enrichBtn = document.getElementById("enrich-btn");
   const metaDescription = document.getElementById("meta-description");
   const metaPublisher = document.getElementById("meta-publisher");
@@ -411,6 +460,20 @@ function initReconcileReviewPage() {
     confirmNewBtn.textContent = decided
       ? "✓ Confirmed new — click to undo"
       : "None of these — confirm as genuinely new";
+
+    const skipped = gap.decision && gap.decision.status === "skipped";
+    skipBtn.textContent = skipped
+      ? "✓ Skipped — click to undo"
+      : "Skip — not needed in Libib (loan, short story, etc.)";
+  }
+
+  function missingTagFor(gap, candidate) {
+    // Checks the candidate's already-resolved `providers` list, not its raw
+    // `tags` — providers is computed server-side through the same
+    // tag-synonym mapping (e.g. Barnes & Noble's own "bn" tag counts as
+    // "nook") used for real matching, so this can't wrongly claim a tag is
+    // missing just because it's spelled differently than expected.
+    return candidate.providers.includes(gap.provider) ? null : gap.provider;
   }
 
   function renderCandidateList(candidates, mode, total) {
@@ -436,6 +499,7 @@ function initReconcileReviewPage() {
       const candidate = mode === "search" ? item : item.candidate;
       const li = document.createElement("li");
       li.className = "candidate-row";
+      const missingTag = missingTagFor(gap, candidate);
 
       const info = document.createElement("div");
       let label = candidate.title + (candidate.creators ? " — " + candidate.creators : "");
@@ -443,14 +507,24 @@ function initReconcileReviewPage() {
         label += " (" + Math.round(item.score * 100) + "% match" +
           (item.author_overlap ? ", author overlaps" : "") + ")";
       }
-      info.textContent = label;
+      info.appendChild(document.createTextNode(label));
+      if (missingTag) {
+        const tagNote = document.createElement("div");
+        tagNote.className = "field-hint";
+        tagNote.textContent = "Needs the \"" + missingTag + "\" tag in Libib";
+        info.appendChild(tagNote);
+      }
       li.appendChild(info);
 
       const isConfirmed = candidate.key === confirmedLibibKey;
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "btn btn-secondary";
-      btn.textContent = isConfirmed ? "✓ Confirmed — click to undo" : "Confirm match";
+      btn.textContent = isConfirmed
+        ? "✓ Confirmed — click to undo"
+        : missingTag
+        ? 'Confirm match (add "' + missingTag + '" tag)'
+        : "Confirm match";
       if (isConfirmed) li.classList.add("selected");
       btn.addEventListener("click", () =>
         saveDecision(isConfirmed ? "undecided" : "confirmed_match", candidate.key)
@@ -519,6 +593,12 @@ function initReconcileReviewPage() {
     const gap = currentGap();
     const alreadyConfirmedNew = gap && gap.decision && gap.decision.status === "confirmed_new";
     saveDecision(alreadyConfirmedNew ? "undecided" : "confirmed_new", null);
+  });
+
+  skipBtn.addEventListener("click", () => {
+    const gap = currentGap();
+    const alreadySkipped = gap && gap.decision && gap.decision.status === "skipped";
+    saveDecision(alreadySkipped ? "undecided" : "skipped", null);
   });
 
   enrichBtn.addEventListener("click", async () => {

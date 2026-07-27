@@ -58,6 +58,28 @@ def test_reconcile_job_start_and_completes(mock_run):
     assert call_kwargs["libib_path"] == "libib.csv"
     assert call_kwargs["chirp"] == "chirp.csv"
     assert call_kwargs["kindle"] is None
+    assert call_kwargs["wait_for_rate_limits"] is False
+
+
+@patch("webapp.app.reconcile_core.run")
+def test_reconcile_job_threads_wait_for_rate_limits_option(mock_run):
+    mock_run.side_effect = _fake_reconcile_run
+
+    response = client.post(
+        "/reconcile/jobs",
+        json={
+            "libib_path": "libib.csv",
+            "chirp": "chirp.csv",
+            "wait_for_rate_limits": True,
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    job = registry.get(job_id)
+    assert _wait_for(lambda: job.status == "completed")
+
+    call_kwargs = mock_run.call_args.kwargs
+    assert call_kwargs["wait_for_rate_limits"] is True
 
 
 @patch("webapp.app.reconcile_core.run")

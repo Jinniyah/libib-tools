@@ -10,6 +10,7 @@ from difflib import SequenceMatcher
 from typing import Optional
 
 from lib.http_retry import request_json
+from lib.http_retry import _sleep as _interruptible_sleep
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +65,41 @@ def _trip_ol_circuit_breaker() -> None:
             _OL_COOLDOWN_SECONDS,
         )
     _ol_blocked_until = time.time() + _OL_COOLDOWN_SECONDS
+
+
+def _await_ol_cooldown(
+    context: str,
+    cancel_fn: Optional[Callable[[], bool]],
+    wait_for_rate_limits: bool,
+) -> bool:
+    """Decide what to do when Open Library is in its post-outage cooldown:
+    wait it out (patient mode, opt-in — some users would rather a slow,
+    complete run than a fast one with gaps left for manual review) or skip
+    this request entirely (the long-standing default, since most gap-book
+    runs are unattended). Returns True if the caller should proceed with the
+    request now, False if it should skip. The wait itself is interruptible —
+    a pending cancel lands within ~1s instead of after the full remaining
+    cooldown."""
+    if not _ol_in_cooldown():
+        return True
+
+    if wait_for_rate_limits:
+        log.info(
+            "Open Library is cooling down for '%s' (%.0fs left) — waiting "
+            "instead of skipping.",
+            context,
+            _ol_cooldown_remaining(),
+        )
+        _interruptible_sleep(_ol_cooldown_remaining(), cancel_fn)
+        return True
+
+    log.info(
+        "Skipping Open Library for '%s' — still cooling down after "
+        "repeated errors (%.0fs left).",
+        context,
+        _ol_cooldown_remaining(),
+    )
+    return False
 
 
 # -----------------------------
@@ -199,15 +235,10 @@ def _ol_query(
     params: dict,
     title_for_log: str,
     cancel_fn: Optional[Callable[[], bool]] = None,
+    wait_for_rate_limits: bool = False,
 ) -> list[dict]:
     """Execute one Open Library search with retries and exponential backoff."""
-    if _ol_in_cooldown():
-        log.info(
-            "Skipping Open Library for '%s' — still cooling down after "
-            "repeated errors (%.0fs left).",
-            title_for_log,
-            _ol_cooldown_remaining(),
-        )
+    if not _await_ol_cooldown(title_for_log, cancel_fn, wait_for_rate_limits):
         return []
 
     data = request_json(
@@ -251,7 +282,10 @@ def _pick_isbn_from_docs(docs: list[dict], title: str) -> Optional[str]:
 
 
 def get_isbn(
-    title: str, author: str, cancel_fn: Optional[Callable[[], bool]] = None
+    title: str,
+    author: str,
+    cancel_fn: Optional[Callable[[], bool]] = None,
+    wait_for_rate_limits: bool = False,
 ) -> Optional[str]:
     """
     Look up an ISBN via Open Library using:
@@ -260,13 +294,23 @@ def get_isbn(
     """
     # Pass 1: title + author
     if author:
-        docs = _ol_query({"title": title, "author": author}, title, cancel_fn=cancel_fn)
+        docs = _ol_query(
+            {"title": title, "author": author},
+            title,
+            cancel_fn=cancel_fn,
+            wait_for_rate_limits=wait_for_rate_limits,
+        )
         isbn = _pick_isbn_from_docs(docs, title)
         if isbn:
             return isbn
 
     # Pass 2: title only
-    docs = _ol_query({"title": title}, title, cancel_fn=cancel_fn)
+    docs = _ol_query(
+        {"title": title},
+        title,
+        cancel_fn=cancel_fn,
+        wait_for_rate_limits=wait_for_rate_limits,
+    )
     isbn = _pick_isbn_from_docs(docs, title)
     if isbn:
         return isbn

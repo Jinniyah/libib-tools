@@ -61,6 +61,24 @@ _SCRAPER_MODULES: dict[str, str] = {
 
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
+
+def _static_asset_version() -> str:
+    """A cache-busting query value derived from the newest mtime across the
+    static files — appended to every <script>/<link> tag as `?v=...`. Found
+    the hard way: this app's static files have no cache-busting at all, so
+    a browser can keep serving a script from before a fix shipped
+    indefinitely, with zero visible error (a click just silently does
+    nothing, since the handler it needs was never attached) — recomputed
+    once at startup rather than per-request, since a running dev server
+    restart is already how a code change takes effect either way."""
+    try:
+        return str(int(max(p.stat().st_mtime for p in _STATIC_DIR.glob("*"))))
+    except ValueError:
+        return "0"
+
+
+templates.env.globals["asset_version"] = _static_asset_version()
+
 # Process-wide singletons: one job registry, one log bridge installation.
 registry = JobRegistry()
 install_log_bridge()
@@ -89,11 +107,12 @@ class ReconcileOptions(BaseModel):
     google: Optional[str] = None
     output_dir: str = "."
     no_enrich: bool = False
+    wait_for_rate_limits: bool = False
 
 
 class ReconcileDecisionRequest(BaseModel):
     gap_key: str
-    status: str  # "confirmed_match" | "confirmed_new" | "undecided"
+    status: str  # "confirmed_match" | "confirmed_new" | "skipped" | "undecided"
     libib_key: Optional[str] = None
     note: Optional[str] = None
 
@@ -252,6 +271,7 @@ def _build_reconcile_run_callable(options: ReconcileOptions) -> Any:
             nook=options.nook,
             google=options.google,
             no_enrich=options.no_enrich,
+            wait_for_rate_limits=options.wait_for_rate_limits,
             cancel_fn=cancel_fn,
         )
 
@@ -464,6 +484,15 @@ def create_app() -> FastAPI:
     @app.get("/reconcile")
     def reconcile_page(request: Request) -> HTMLResponse:
         return templates.TemplateResponse(request, "reconcile.html", {})
+
+    @app.get("/api/reconcile/review/snapshots")
+    def reconcile_review_snapshots(dir: str) -> dict[str, Any]:
+        # Reads only from disk — works whether the job that produced these
+        # is still tracked in the (in-memory, restart-losing) job registry
+        # or not. This is the missing "how do I get back" step for a closed
+        # tab or a server restart; the snapshot/decisions themselves were
+        # already durable by design.
+        return {"snapshots": reconcile_review.list_review_snapshots(dir)}
 
     @app.post("/reconcile/jobs")
     def reconcile_job_start(options: ReconcileOptions) -> dict[str, str]:

@@ -9,8 +9,10 @@ import os
 import tempfile
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
+import libib_reconcile.review as review_module
 from lib import EnrichmentResult
 from libib_reconcile.libib_reader import LibibEntry
 from libib_reconcile.reconciler import MatchResult, ReconcileResult, ScrapedBookResult
@@ -22,6 +24,17 @@ from libib_reconcile.review import (
 from webapp.app import app
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_global_skip_list(tmp_path, monkeypatch):
+    """See the identical fixture in test_reconcile_review.py — the global
+    skip list lives at a fixed real-user path by design; redirect it here
+    too, since this file also exercises write_review_snapshot() and the
+    decisions route (which calls save_decision() under the hood)."""
+    monkeypatch.setattr(
+        review_module, "_GLOBAL_SKIP_LIST_PATH", str(tmp_path / "reconcile_skips.json")
+    )
 
 
 def _entry(title, creators=""):
@@ -411,3 +424,28 @@ def test_manual_enrichment_unknown_gap_key_returns_404():
             json={"gap_key": "not-a-real-key", "publisher": "X"},
         )
     assert response.status_code == 404
+
+
+# ==========================
+# GET /api/reconcile/review/snapshots — resuming after a closed tab
+# ==========================
+
+
+def test_list_snapshots_route_finds_a_real_snapshot():
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _build_snapshot(tmp)
+        response = client.get("/api/reconcile/review/snapshots", params={"dir": tmp})
+
+    assert response.status_code == 200
+    snapshots = response.json()["snapshots"]
+    assert len(snapshots) == 1
+    assert snapshots[0]["path"] == snapshot_path
+    assert snapshots[0]["gap_count"] == 1
+
+
+def test_list_snapshots_route_empty_for_unknown_dir():
+    response = client.get(
+        "/api/reconcile/review/snapshots", params={"dir": r"C:\not\a\real\dir"}
+    )
+    assert response.status_code == 200
+    assert response.json()["snapshots"] == []

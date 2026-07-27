@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+import libib_reconcile.review as review_module
 from lib import EnrichmentResult
 from libib_reconcile.libib_reader import LibibEntry
 from libib_reconcile.reconciler import MatchResult, ReconcileResult, ScrapedBookResult
@@ -13,6 +14,7 @@ from libib_reconcile.review import (
     Decision,
     finalize_review,
     gap_has_enrichment,
+    list_review_snapshots,
     load_decisions,
     load_review_snapshot,
     rank_candidates,
@@ -26,6 +28,17 @@ from libib_reconcile.review import (
 )
 
 EMPTY = EnrichmentResult()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_global_skip_list(tmp_path, monkeypatch):
+    """The global skip list lives at a fixed, real-user path
+    (~/.config/libibtools/reconcile_skips.json) by design — redirect it to
+    a throwaway location for every test in this file so tests never read or
+    write the developer's actual home directory."""
+    monkeypatch.setattr(
+        review_module, "_GLOBAL_SKIP_LIST_PATH", str(tmp_path / "reconcile_skips.json")
+    )
 
 
 def _entry(
@@ -474,6 +487,30 @@ def test_finalize_undecided_gap_book_stays_in_csv_by_default():
     assert tag_report_path is None
 
 
+def test_finalize_excludes_skipped_gap_books_from_csv_with_no_tag_suggestion():
+    """A "skipped" decision (library loan, short story — genuinely not
+    wanted in Libib) must drop the book from the reviewed gap CSV, same as
+    confirmed_match, but must NOT generate a tag suggestion — there's no
+    Libib entry to tag, unlike a real match."""
+    gap_results = [_gap_scraped_result("A Library Loan", "Author", provider="kobo")]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _write_snapshot(
+            tmp, [], gap_results, timestamp="2026-07-27_12-00"
+        )
+        snapshot = load_review_snapshot(snapshot_path)
+        gap_key = snapshot["gap_books"][0]["key"]
+
+        save_decision(tmp, gap_key, "skipped")
+        gap_csv_path, tag_report_path = finalize_review(snapshot_path, tmp)
+
+        with open(gap_csv_path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+
+    assert rows == []
+    assert tag_report_path is None
+
+
 def test_finalize_is_re_runnable_and_non_destructive():
     """finalize_review must be safely callable multiple times as more
     decisions accumulate, without clobbering earlier finalize output."""
@@ -489,6 +526,98 @@ def test_finalize_is_re_runnable_and_non_destructive():
 
         assert os.path.exists(first_csv)
         assert os.path.exists(second_csv)
+
+
+# ==========================
+# Global skip list — cross-session, cross-output-dir "skipped" memory
+# ==========================
+
+
+def test_skipping_a_gap_records_it_in_the_global_skip_list():
+    gap_results = [_gap_scraped_result("A Library Loan", "Author", provider="kobo")]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _write_snapshot(tmp, [], gap_results, timestamp="ts")
+        gap_key = load_review_snapshot(snapshot_path)["gap_books"][0]["key"]
+
+        save_decision(tmp, gap_key, "skipped")
+
+    with open(review_module._GLOBAL_SKIP_LIST_PATH, encoding="utf-8") as f:
+        global_skips = json.load(f)
+    assert gap_key in global_skips
+
+
+def test_undoing_a_skip_removes_it_from_the_global_skip_list():
+    gap_results = [_gap_scraped_result("A Library Loan", "Author", provider="kobo")]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _write_snapshot(tmp, [], gap_results, timestamp="ts")
+        gap_key = load_review_snapshot(snapshot_path)["gap_books"][0]["key"]
+
+        save_decision(tmp, gap_key, "skipped")
+        save_decision(tmp, gap_key, "undecided")
+
+    with open(review_module._GLOBAL_SKIP_LIST_PATH, encoding="utf-8") as f:
+        global_skips = json.load(f)
+    assert gap_key not in global_skips
+
+
+def test_confirming_a_match_does_not_touch_the_global_skip_list():
+    gap_results = [_gap_scraped_result("Some Book", "Author", provider="kobo")]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _write_snapshot(tmp, [], gap_results, timestamp="ts")
+        gap_key = load_review_snapshot(snapshot_path)["gap_books"][0]["key"]
+
+        save_decision(tmp, gap_key, "confirmed_new")
+
+    assert not os.path.exists(review_module._GLOBAL_SKIP_LIST_PATH)
+
+
+def test_new_session_pre_labels_a_gap_previously_skipped_elsewhere():
+    """The actual point of this feature: a book skipped in one output
+    directory must come back already marked "skipped" in a brand-new
+    session that uses a completely different output directory — e.g. a
+    fresh dated folder — the moment it's re-scraped and reappears as a gap
+    with the same identity (same title/author/isbn/provider)."""
+    gap_results = [_gap_scraped_result("A Library Loan", "Author", provider="kobo")]
+
+    with tempfile.TemporaryDirectory() as old_session:
+        old_snapshot_path = _write_snapshot(
+            old_session, [], gap_results, timestamp="ts-old"
+        )
+        gap_key = load_review_snapshot(old_snapshot_path)["gap_books"][0]["key"]
+        save_decision(old_session, gap_key, "skipped")
+
+    with tempfile.TemporaryDirectory() as new_session:
+        new_snapshot_path = _write_snapshot(
+            new_session, [], gap_results, timestamp="ts-new"
+        )
+        new_decisions = load_decisions(new_session)
+        assert load_review_snapshot(new_snapshot_path)["gap_books"][0]["key"] == gap_key
+
+    assert new_decisions[gap_key].status == "skipped"
+
+
+def test_new_session_never_overwrites_an_existing_decision_for_that_key():
+    """Global pre-labeling must not clobber a decision this exact output
+    directory already recorded for the same key — e.g. from a manual
+    confirm made before the global list happened to catch up."""
+    gap_results = [_gap_scraped_result("A Library Loan", "Author", provider="kobo")]
+
+    with tempfile.TemporaryDirectory() as old_session:
+        old_snapshot_path = _write_snapshot(
+            old_session, [], gap_results, timestamp="ts-old"
+        )
+        gap_key = load_review_snapshot(old_snapshot_path)["gap_books"][0]["key"]
+        save_decision(old_session, gap_key, "skipped")
+
+    with tempfile.TemporaryDirectory() as new_session:
+        save_decision(new_session, gap_key, "confirmed_new")
+        _write_snapshot(new_session, [], gap_results, timestamp="ts-new")
+        new_decisions = load_decisions(new_session)
+
+    assert new_decisions[gap_key].status == "confirmed_new"
 
 
 # ==========================
@@ -690,3 +819,104 @@ def test_set_manual_enrichment_unknown_key_raises_key_error():
         )
         with pytest.raises(KeyError):
             set_manual_enrichment(snapshot_path, "not-a-real-key", {"publisher": "X"})
+
+
+# ==========================
+# list_review_snapshots — resuming a review after closing the tab
+# (or restarting the server) without keeping the exact snapshot path
+# ==========================
+
+
+def test_list_review_snapshots_returns_empty_for_nonexistent_dir():
+    assert list_review_snapshots(r"C:\definitely\not\a\real\path") == []
+
+
+def test_list_review_snapshots_finds_and_summarizes_snapshot_files():
+    gap_results = [_gap_scraped_result("Some Book", provider="kobo")]
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _write_snapshot(
+            tmp, [], gap_results, timestamp="2026-07-25_09-00"
+        )
+        summaries = list_review_snapshots(tmp)
+
+    assert len(summaries) == 1
+    assert summaries[0]["path"] == snapshot_path
+    assert summaries[0]["gap_count"] == 1
+    assert summaries[0]["decided_count"] == 0
+
+
+def test_list_review_snapshots_reflects_decided_count():
+    gap_results = [
+        _gap_scraped_result("Book A", provider="kobo"),
+        _gap_scraped_result("Book B", provider="kobo"),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _write_snapshot(
+            tmp, [], gap_results, timestamp="2026-07-25_09-00"
+        )
+        gap_key = load_review_snapshot(snapshot_path)["gap_books"][0]["key"]
+        save_decision(tmp, gap_key, "confirmed_new")
+
+        summaries = list_review_snapshots(tmp)
+
+    assert summaries[0]["gap_count"] == 2
+    assert summaries[0]["decided_count"] == 1
+
+
+def test_list_review_snapshots_sorted_newest_first():
+    with tempfile.TemporaryDirectory() as tmp:
+        older_path = os.path.join(
+            tmp, "reconcile_2026-07-24_09-00_review_snapshot.json"
+        )
+        newer_path = os.path.join(
+            tmp, "reconcile_2026-07-25_09-00_review_snapshot.json"
+        )
+        for path, generated_at in [
+            (older_path, "2026-07-24T09:00:00"),
+            (newer_path, "2026-07-25T09:00:00"),
+        ]:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "generated_at": generated_at,
+                        "source_paths": {},
+                        "gap_books": [],
+                        "candidate_pool": [],
+                    },
+                    f,
+                )
+
+        summaries = list_review_snapshots(tmp)
+
+    assert [s["path"] for s in summaries] == [newer_path, older_path]
+
+
+def test_list_review_snapshots_skips_unparseable_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        bad_path = os.path.join(tmp, "reconcile_2026-07-24_09-00_review_snapshot.json")
+        with open(bad_path, "w", encoding="utf-8") as f:
+            f.write("not valid json{{{")
+
+        summaries = list_review_snapshots(tmp)
+
+    assert summaries == []
+
+
+def test_list_review_snapshots_ignores_non_snapshot_files():
+    gap_results = [_gap_scraped_result("Some Book", provider="kobo")]
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_snapshot(tmp, [], gap_results, timestamp="2026-07-25_09-00")
+        with open(
+            os.path.join(tmp, "reconcile_review_decisions.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump({}, f)
+        with open(
+            os.path.join(tmp, "reconcile_2026-07-25_09-00_gap.csv"),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            f.write("title\n")
+
+        summaries = list_review_snapshots(tmp)
+
+    assert len(summaries) == 1

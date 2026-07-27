@@ -407,6 +407,11 @@ main {
   color: var(--color-info);
 }
 
+.badge-status-skipped {
+  background: var(--color-warning-bg);
+  color: var(--color-warning);
+}
+
 .review-layout {
   display: grid;
   grid-template-columns: minmax(16rem, 1fr) minmax(20rem, 1.5fr);

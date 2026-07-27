@@ -65,9 +65,16 @@ def enrich_gap_books(
     gap_books: list[ScrapedBookResult],
     no_enrich: bool = False,
     cancel_fn: Callable[[], bool] = lambda: False,
+    wait_for_rate_limits: bool = False,
 ) -> list[tuple[ScrapedBookResult, EnrichmentResult]]:
     """Run lib.enrich_book() over each gap book, same pattern as every
-    scraper's own enrich_books() step. Skipped entirely if no_enrich."""
+    scraper's own enrich_books() step. Skipped entirely if no_enrich.
+
+    `wait_for_rate_limits` opts into waiting out a tripped Open Library/
+    Google Books circuit breaker instead of skipping that source for a book
+    hit during the cooldown — slower, but nothing gets left without
+    metadata just because of unlucky timing. See lib.enrich_book().
+    """
     if no_enrich:
         return [(r, _NULL_ENRICHMENT) for r in gap_books]
 
@@ -87,6 +94,7 @@ def enrich_gap_books(
             upc_isbn10 or None,
             cover,
             cancel_fn=cancel_fn,
+            wait_for_rate_limits=wait_for_rate_limits,
         )
         sleep_between_requests()
 

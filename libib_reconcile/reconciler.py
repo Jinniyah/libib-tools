@@ -109,13 +109,45 @@ def author_overlap(a: str, b: str) -> bool:
     return bool(a_words & b_words)
 
 
+def _normalize_title(s: str) -> str:
+    return re.sub(r"[^\w\s]", "", s.lower()).strip()
+
+
+def _is_title_containment(a: str, b: str) -> bool:
+    """True if one title, once lowercased and stripped of punctuation, is
+    fully contained in the other. Catches Libib's own convention of
+    appending series/subtitle text to the real title — "Veiled" -> "Veiled
+    (An Alex Verus Novel)", "Blood of the Mantis" -> "Blood of the Mantis
+    (Book #3 from the series: Shadows of the Apt)", "... " -> "... - Book 3
+    of Sugar Shack Witch Mysteries" — real cases found live (2026-07-26).
+    A length-sensitive ratio (see title_score) systematically under-scores
+    these the longer the appended text is, to the point of dropping some
+    below the automated matcher's threshold entirely. Requires the shorter
+    side to be non-trivial (>= 4 normalized characters) so single-word
+    coincidences can't trigger it."""
+    na, nb = _normalize_title(a), _normalize_title(b)
+    if not na or not nb or min(len(na), len(nb)) < 4:
+        return False
+    return na in nb or nb in na
+
+
+_CONTAINMENT_SCORE_FLOOR = 0.9
+
+
 def title_score(a: str, b: str) -> float:
     """Raw title similarity, with no plausibility gate applied — public
     (not just find_fuzzy_match's internal detail) since the interactive
     review feature (libib_reconcile/review.py) reuses it directly to rank
     "maybe" candidates the automated matcher's _title_is_plausible() gate
-    rejected outright."""
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+    rejected outright. A title-containment match (see _is_title_containment)
+    is boosted to at least _CONTAINMENT_SCORE_FLOOR — otherwise a real match
+    with a long appended series/subtitle would rank (and display) as a weak
+    one purely because of the length difference, not because it's actually
+    a worse match."""
+    ratio = SequenceMatcher(None, a.lower(), b.lower()).ratio()
+    if _is_title_containment(a, b):
+        return max(ratio, _CONTAINMENT_SCORE_FLOOR)
+    return ratio
 
 
 def reconcile(
@@ -153,15 +185,21 @@ def reconcile(
                 if (provider, idx) in consumed:
                     continue
                 title, author, _, _ = book
-                if not _title_is_plausible(entry.title, title):
-                    continue
-                confidence = (
-                    "medium"
-                    if entry.creators
-                    and author
-                    and author_overlap(entry.creators, author)
-                    else "low"
+                has_author_overlap = bool(
+                    entry.creators and author and author_overlap(entry.creators, author)
                 )
+                # Title containment alone (see _is_title_containment) is a
+                # weaker signal than a high overall ratio — it can occur
+                # incidentally for short/generic titles — so it only counts
+                # as plausible here when the author also corroborates it.
+                # A strong ratio (_title_is_plausible's own threshold/word-
+                # overlap checks) needs no such extra corroboration.
+                plausible = _title_is_plausible(entry.title, title) or (
+                    has_author_overlap and _is_title_containment(entry.title, title)
+                )
+                if not plausible:
+                    continue
+                confidence = "medium" if has_author_overlap else "low"
                 candidates.append(
                     (title_score(entry.title, title), provider, idx, book, confidence)
                 )

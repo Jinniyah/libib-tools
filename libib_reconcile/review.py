@@ -42,6 +42,19 @@ from libib_reconcile.reconciler import (
 
 _EXCLUDED_TAGS = frozenset({"deleted", "removed"})
 
+# Persistent, cross-session record of "skipped" decisions — deliberately NOT
+# scoped to any one output directory, unlike reconcile_review_decisions.json.
+# A skip means "this exact book (library loan, short story, whatever) should
+# never be in Libib" — a fact about the book, not about one reconcile run —
+# so it needs to survive a fresh output directory being used next time
+# (e.g. a dated per-session folder), not just a fresh snapshot in the same
+# one. Fixed app-config location, matching the (planned) Google Books
+# credentials path convention (~/.config/libibtools/...), so it's found
+# automatically without a new path the user has to remember to pass in.
+_GLOBAL_SKIP_LIST_PATH = os.path.join(
+    os.path.expanduser("~"), ".config", "libibtools", "reconcile_skips.json"
+)
+
 _DEFAULT_RANK_LIMIT = 25
 _DEFAULT_RANK_FLOOR = 0.15
 _DEFAULT_SEARCH_LIMIT = 50
@@ -79,7 +92,7 @@ class ReviewSnapshot(TypedDict):
 
 @dataclass
 class Decision:
-    status: str  # "confirmed_match" | "confirmed_new"
+    status: str  # "confirmed_match" | "confirmed_new" | "skipped"
     libib_key: Optional[str]
     decided_at: str
     note: Optional[str] = None
@@ -228,6 +241,8 @@ def write_review_snapshot(
     with open(path, "w", encoding="utf-8") as f:
         json.dump(snapshot, f, indent=2)
 
+    _apply_global_skips_to_new_gaps(gap_books, output_dir)
+
     return path
 
 
@@ -362,6 +377,54 @@ def load_decisions(output_dir: str) -> dict[str, Decision]:
     return {key: Decision.from_dict(value) for key, value in raw.items()}
 
 
+def _write_decisions(output_dir: str, decisions: dict[str, Decision]) -> None:
+    """Atomic write (temp file + os.replace) shared by save_decision() and
+    the global-skip pre-labeling step below — this file is rewritten
+    repeatedly across a review session, unlike the write-once snapshot."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = _decisions_path(output_dir)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump({key: d.to_dict() for key, d in decisions.items()}, f, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _load_global_skips() -> dict[str, str]:
+    """gap_key -> skipped_at (iso timestamp). See _GLOBAL_SKIP_LIST_PATH."""
+    if not os.path.exists(_GLOBAL_SKIP_LIST_PATH):
+        return {}
+    with open(_GLOBAL_SKIP_LIST_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_global_skips(skips: dict[str, str]) -> None:
+    os.makedirs(os.path.dirname(_GLOBAL_SKIP_LIST_PATH), exist_ok=True)
+    tmp_path = _GLOBAL_SKIP_LIST_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(skips, f, indent=2)
+    os.replace(tmp_path, _GLOBAL_SKIP_LIST_PATH)
+
+
+def _sync_global_skip(gap_key: str, status: str) -> None:
+    """Keep the persistent, cross-session global skip list in step with this
+    decision: a "skipped" status remembers this exact book (by its content-
+    hash key) forever, regardless of output directory, so a future session's
+    write_review_snapshot() can pre-label it the moment it reappears as a
+    gap (see _apply_global_skips_to_new_gaps). Changing your mind — undoing
+    the skip, or picking a different outcome entirely — removes it from the
+    global list too, so it doesn't silently re-skip itself later."""
+    global_skips = _load_global_skips()
+    if status == "skipped":
+        if gap_key in global_skips:
+            return
+        global_skips[gap_key] = datetime.now().isoformat(timespec="seconds")
+    else:
+        if gap_key not in global_skips:
+            return
+        del global_skips[gap_key]
+    _save_global_skips(global_skips)
+
+
 def save_decision(
     output_dir: str,
     gap_key: str,
@@ -369,9 +432,7 @@ def save_decision(
     libib_key: Optional[str] = None,
     note: Optional[str] = None,
 ) -> dict[str, Decision]:
-    """Upsert one decision, atomically (write-to-temp then os.replace — this
-    file is rewritten repeatedly across a review session, unlike the
-    write-once snapshot). status="undecided" clears a prior decision (undo)
+    """Upsert one decision. status="undecided" clears a prior decision (undo)
     rather than storing an "undecided" record — absence from this file
     already means "pending" everywhere else in this module. Returns the
     full updated decisions dict."""
@@ -387,14 +448,89 @@ def save_decision(
             note=note,
         )
 
-    os.makedirs(output_dir, exist_ok=True)
-    path = _decisions_path(output_dir)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump({key: d.to_dict() for key, d in decisions.items()}, f, indent=2)
-    os.replace(tmp_path, path)
+    _write_decisions(output_dir, decisions)
+    _sync_global_skip(gap_key, status)
 
     return decisions
+
+
+def _apply_global_skips_to_new_gaps(
+    gap_books: list[GapBookDict], output_dir: str
+) -> None:
+    """Pre-label any gap book whose content-hash key is already in the
+    persistent global skip list (set in a previous session, possibly
+    against a different output directory) as "skipped" in THIS session's
+    own decisions file — a library loan or short story already told to
+    this tool to ignore doesn't need to be re-decided every time it's
+    re-scraped and shows up as a gap again. Never overwrites a decision
+    this output directory already has for that key."""
+    global_skips = _load_global_skips()
+    if not global_skips:
+        return
+
+    decisions = load_decisions(output_dir)
+    changed = False
+    now = datetime.now().isoformat(timespec="seconds")
+
+    for gap in gap_books:
+        key = gap["key"]
+        if key in global_skips and key not in decisions:
+            decisions[key] = Decision(status="skipped", libib_key=None, decided_at=now)
+            changed = True
+
+    if changed:
+        _write_decisions(output_dir, decisions)
+
+
+_SNAPSHOT_PREFIX = "reconcile_"
+_SNAPSHOT_SUFFIX = "_review_snapshot.json"
+
+
+class SnapshotSummary(TypedDict):
+    path: str
+    generated_at: str
+    gap_count: int
+    decided_count: int
+
+
+def list_review_snapshots(output_dir: str) -> list[SnapshotSummary]:
+    """Scan a directory for review snapshot files, newest first — the way
+    back to an in-progress review for someone who closed the browser tab
+    (or even restarted the server) without keeping the exact snapshot path.
+    Both the snapshot and the decisions file it needs are already durable on
+    disk by design; this is purely the missing discovery step, not new
+    persistence. Skips anything that fails to parse (a half-written file,
+    something else entirely) rather than letting one bad file break the
+    whole listing.
+    """
+    if not os.path.isdir(output_dir):
+        return []
+
+    decisions = load_decisions(output_dir)
+    summaries: list[SnapshotSummary] = []
+
+    for name in os.listdir(output_dir):
+        if not (name.startswith(_SNAPSHOT_PREFIX) and name.endswith(_SNAPSHOT_SUFFIX)):
+            continue
+        path = os.path.join(output_dir, name)
+        try:
+            snapshot = load_review_snapshot(path)
+        except (OSError, ValueError):
+            continue
+
+        gap_keys = [g["key"] for g in snapshot["gap_books"]]
+        decided = sum(1 for key in gap_keys if key in decisions)
+        summaries.append(
+            {
+                "path": path,
+                "generated_at": snapshot["generated_at"],
+                "gap_count": len(gap_keys),
+                "decided_count": decided,
+            }
+        )
+
+    summaries.sort(key=lambda s: s["generated_at"], reverse=True)
+    return summaries
 
 
 def _claimed_libib_keys(
@@ -470,14 +606,20 @@ def search_candidates(
 
 
 def finalize_review(snapshot_path: str, output_dir: str) -> tuple[str, Optional[str]]:
-    """Regenerate the reviewed gap CSV (confirmed-match gap books excluded —
-    undecided books stay in by default, matching "never silently drop
-    anything") plus a tag-suggestions report for every confirmed match. Both
-    reuse existing output.py writers completely unchanged; enrichment comes
-    straight from the snapshot, no network calls. Safe to re-run repeatedly
-    as more decisions accumulate — each run writes a fresh, distinctly-
-    timestamped pair of files rather than overwriting the original gap CSV,
-    which stays on disk as an audit trail.
+    """Regenerate the reviewed gap CSV (confirmed-match and skipped gap
+    books excluded — undecided books stay in by default, matching "never
+    silently drop anything") plus a tag-suggestions report for every
+    confirmed match. Both reuse existing output.py writers completely
+    unchanged; enrichment comes straight from the snapshot, no network
+    calls. Safe to re-run repeatedly as more decisions accumulate — each
+    run writes a fresh, distinctly-timestamped pair of files rather than
+    overwriting the original gap CSV, which stays on disk as an audit
+    trail.
+
+    "skipped" is deliberately distinct from "confirmed_match": a skip means
+    the book was never in Libib and never should be (a library loan, a
+    short story not worth cataloging) — excluded from the gap CSV like a
+    match, but with no tag-suggestion, since there's no Libib entry to tag.
     """
     snapshot = load_review_snapshot(snapshot_path)
     decisions = load_decisions(output_dir)
@@ -493,6 +635,9 @@ def finalize_review(snapshot_path: str, output_dir: str) -> tuple[str, Optional[
             if libib is not None:
                 suggestions.append((g["provider"], libib["title"], libib["creators"]))
             continue  # excluded from the reviewed gap CSV either way
+
+        if decision and decision.status == "skipped":
+            continue  # not wanted in Libib at all — no tag suggestion either
 
         scraped_result = ScrapedBookResult(
             g["provider"],

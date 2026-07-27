@@ -39,8 +39,31 @@ def test_resolves_missing_isbn(mock_get_isbn, mock_sleep):
     enriched = enrich_missing_isbns(result)
 
     assert enriched.scraped_results[0].book[2] == "9780593135204"
-    mock_get_isbn.assert_called_once_with("New Book", "New Author", cancel_fn=ANY)
+    mock_get_isbn.assert_called_once_with(
+        "New Book", "New Author", cancel_fn=ANY, wait_for_rate_limits=False
+    )
     mock_sleep.assert_called_once()
+
+
+@patch("libib_reconcile.isbn_enricher.sleep_between_requests")
+@patch("libib_reconcile.isbn_enricher.get_isbn", return_value="9780593135204")
+def test_threads_wait_for_rate_limits_into_get_isbn(mock_get_isbn, mock_sleep):
+    result = ReconcileResult(
+        libib_results=[],
+        scraped_results=[
+            ScrapedBookResult(
+                "kindle",
+                ("New Book", "New Author", None, "cover"),
+                "missing_from_libib",
+            )
+        ],
+    )
+
+    enrich_missing_isbns(result, wait_for_rate_limits=True)
+
+    mock_get_isbn.assert_called_once_with(
+        "New Book", "New Author", cancel_fn=ANY, wait_for_rate_limits=True
+    )
 
 
 @patch("libib_reconcile.isbn_enricher.sleep_between_requests")
