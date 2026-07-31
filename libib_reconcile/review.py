@@ -15,9 +15,16 @@
 #     snapshot (e.g. a re-scrape before a re-export). Written atomically
 #     (temp file + os.replace) since it's rewritten repeatedly.
 #
+# The same snapshot also backs the mirror-image "orphan" review: for each
+# Libib entry the scrapes never matched (status "libib_only" in
+# candidate_pool), a human can flag it as a duplicate of another Libib
+# entry or as no longer owned. Decisions live in a sibling file,
+# reconcile_orphan_decisions.json, keyed by stable_libib_key rather than
+# stable_gap_key since there's no gap book on this side of the review.
+#
 # Confirmed matches never write back to Libib directly — only ever affect
 # this tool's own output (excluded from the reviewed gap CSV, listed in a
-# tag-suggestions report the user applies by hand).
+# tag-suggestions report / orphan-review report the user applies by hand).
 
 from __future__ import annotations
 
@@ -60,6 +67,7 @@ _DEFAULT_RANK_FLOOR = 0.15
 _DEFAULT_SEARCH_LIMIT = 50
 
 _DECISIONS_FILENAME = "reconcile_review_decisions.json"
+_ORPHAN_DECISIONS_FILENAME = "reconcile_orphan_decisions.json"
 
 
 class GapBookDict(TypedDict):
@@ -368,8 +376,7 @@ def set_manual_enrichment(
     return gap
 
 
-def load_decisions(output_dir: str) -> dict[str, Decision]:
-    path = _decisions_path(output_dir)
+def _load_decisions_file(path: str) -> dict[str, Decision]:
     if not os.path.exists(path):
         return {}
     with open(path, encoding="utf-8") as f:
@@ -377,16 +384,23 @@ def load_decisions(output_dir: str) -> dict[str, Decision]:
     return {key: Decision.from_dict(value) for key, value in raw.items()}
 
 
-def _write_decisions(output_dir: str, decisions: dict[str, Decision]) -> None:
-    """Atomic write (temp file + os.replace) shared by save_decision() and
-    the global-skip pre-labeling step below — this file is rewritten
-    repeatedly across a review session, unlike the write-once snapshot."""
-    os.makedirs(output_dir, exist_ok=True)
-    path = _decisions_path(output_dir)
+def _write_decisions_file(path: str, decisions: dict[str, Decision]) -> None:
+    """Atomic write (temp file + os.replace) — shared by the gap-book and
+    orphan decision stores alike, both of which are rewritten repeatedly
+    across a review session, unlike the write-once snapshot."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump({key: d.to_dict() for key, d in decisions.items()}, f, indent=2)
     os.replace(tmp_path, path)
+
+
+def load_decisions(output_dir: str) -> dict[str, Decision]:
+    return _load_decisions_file(_decisions_path(output_dir))
+
+
+def _write_decisions(output_dir: str, decisions: dict[str, Decision]) -> None:
+    _write_decisions_file(_decisions_path(output_dir), decisions)
 
 
 def _load_global_skips() -> dict[str, str]:
@@ -451,6 +465,44 @@ def save_decision(
     _write_decisions(output_dir, decisions)
     _sync_global_skip(gap_key, status)
 
+    return decisions
+
+
+def _orphan_decisions_path(output_dir: str) -> str:
+    return os.path.join(output_dir, _ORPHAN_DECISIONS_FILENAME)
+
+
+def load_orphan_decisions(output_dir: str) -> dict[str, Decision]:
+    return _load_decisions_file(_orphan_decisions_path(output_dir))
+
+
+def save_orphan_decision(
+    output_dir: str,
+    orphan_key: str,
+    status: str,  # "duplicate" | "needs_archive" | "keep" | "undecided"
+    libib_key: Optional[str] = None,
+    note: Optional[str] = None,
+) -> dict[str, Decision]:
+    """Upsert one orphan decision — same "undecided clears" convention as
+    save_decision(), in a sibling file (reconcile_orphan_decisions.json)
+    rather than the gap-book decisions file, since the two are keyed in
+    different spaces (stable_gap_key vs stable_libib_key) and reviewed on
+    separate pages. No global-skip-list sync: that concept ("this exact
+    scraped book should never be in Libib") is specific to gap books and
+    doesn't apply to an existing Libib entry."""
+    decisions = load_orphan_decisions(output_dir)
+
+    if status == "undecided":
+        decisions.pop(orphan_key, None)
+    else:
+        decisions[orphan_key] = Decision(
+            status=status,
+            libib_key=libib_key,
+            decided_at=datetime.now().isoformat(timespec="seconds"),
+            note=note,
+        )
+
+    _write_decisions_file(_orphan_decisions_path(output_dir), decisions)
     return decisions
 
 
@@ -605,6 +657,79 @@ def search_candidates(
     return matches[:limit], len(matches)
 
 
+def list_orphans(snapshot: ReviewSnapshot) -> list[LibibCandidateDict]:
+    """Libib entries tagged kindle/chirp/nook/bn (etc.) that no scrape
+    matched — the mirror of gap_books, and the same set write_orphan_report()
+    puts in reconcile_{ts}_orphans.txt. Read straight off candidate_pool's
+    own `status` field (set by reconciler.reconcile()) rather than a
+    separate snapshot field, so this can never drift from the match data
+    that produced the static report."""
+    return [c for c in snapshot["candidate_pool"] if c["status"] == "libib_only"]
+
+
+def resolved_via_gap_review(gap_decisions: dict[str, Decision]) -> set[str]:
+    """libib_keys already confirmed_match-linked to some gap book during a
+    *gap*-review session — i.e. the automated matcher missed a real match,
+    a human found it from the other direction, and there's nothing left for
+    the orphan side to decide. Reuses _claimed_libib_keys with an
+    exclude_gap_key that can never match a real (hashed) gap key, since the
+    two computations are otherwise identical."""
+    return _claimed_libib_keys(gap_decisions, exclude_gap_key="")
+
+
+def rank_orphan_duplicates(
+    orphan: LibibCandidateDict,
+    candidate_pool: list[LibibCandidateDict],
+    limit: int = _DEFAULT_RANK_LIMIT,
+    score_floor: float = _DEFAULT_RANK_FLOOR,
+) -> list[dict]:
+    """Top-N other Libib entries by title similarity to this orphan — same
+    scoring as rank_candidates(), but anchored on another candidate_pool
+    entry's own title/creators instead of a gap book, and excluding only
+    the orphan itself (not "claimed" entries: a duplicate candidate being
+    already matched to something else is exactly the case this is meant to
+    catch, e.g. two Libib records for the same book where only one is still
+    actually owned)."""
+    scored = []
+    for c in candidate_pool:
+        if c["key"] == orphan["key"]:
+            continue
+        score = title_score(orphan["title"], c["title"])
+        if score < score_floor:
+            continue
+        overlap = bool(
+            orphan["creators"]
+            and c["creators"]
+            and author_overlap(orphan["creators"], c["creators"])
+        )
+        scored.append((score, overlap, c))
+
+    scored.sort(key=lambda t: (-t[0], not t[1], t[2]["key"]))
+    return [
+        {"candidate": c, "score": score, "author_overlap": overlap}
+        for score, overlap, c in scored[:limit]
+    ]
+
+
+def search_orphan_duplicates(
+    query: str,
+    candidate_pool: list[LibibCandidateDict],
+    exclude_key: str,
+    limit: int = _DEFAULT_SEARCH_LIMIT,
+) -> tuple[list[LibibCandidateDict], int]:
+    """Plain substring match over title+author across the WHOLE pool, same
+    guaranteed fallback role as search_candidates() — only excludes the
+    orphan's own key, not anything "claimed" (see rank_orphan_duplicates)."""
+    needle = _normalize(query)
+    matches = [
+        c
+        for c in candidate_pool
+        if c["key"] != exclude_key
+        and (needle in _normalize(c["title"]) or needle in _normalize(c["creators"]))
+    ]
+    return matches[:limit], len(matches)
+
+
 def finalize_review(snapshot_path: str, output_dir: str) -> tuple[str, Optional[str]]:
     """Regenerate the reviewed gap CSV (confirmed-match and skipped gap
     books excluded — undecided books stay in by default, matching "never
@@ -655,3 +780,45 @@ def finalize_review(snapshot_path: str, output_dir: str) -> tuple[str, Optional[
     tag_report_path = write_tag_suggestions_report(suggestions, output_dir, finalize_ts)
 
     return gap_csv_path, tag_report_path
+
+
+def finalize_orphan_review(snapshot_path: str, output_dir: str) -> Optional[str]:
+    """Write a plain-text action report for orphans reviewed as "duplicate"
+    or "needs_archive" — "keep" and undecided orphans produce no line, since
+    there's nothing actionable to tell the user yet. Same "only ever report,
+    never write back to Libib" posture as write_tag_suggestions_report():
+    this tells the user exactly what manual edit to make, it doesn't make
+    it. Returns None if nothing has been decided yet, matching
+    write_orphan_report()'s own Optional[str] convention."""
+    snapshot = load_review_snapshot(snapshot_path)
+    decisions = load_orphan_decisions(output_dir)
+    candidates_by_key = {c["key"]: c for c in snapshot["candidate_pool"]}
+
+    lines: list[str] = []
+    for orphan in list_orphans(snapshot):
+        decision = decisions.get(orphan["key"])
+        if decision is None:
+            continue
+
+        label = f'"{orphan["title"]}" by {orphan["creators"]}'
+        if decision.status == "duplicate":
+            dup = candidates_by_key.get(decision.libib_key or "")
+            dup_label = f'"{dup["title"]}" by {dup["creators"]}' if dup else "another entry"
+            lines.append(f"Archive (duplicate of {dup_label}): {label}")
+        elif decision.status == "needs_archive":
+            lines.append(f"Archive (no longer owned): {label}")
+        # "keep": reviewed, no action needed — no line.
+
+    if not lines:
+        return None
+
+    finalize_ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"reconcile_{finalize_ts}_orphan_review.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("Orphans reviewed — Libib edits to make by hand\n")
+        f.write("=" * 44 + "\n\n")
+        for line in lines:
+            f.write(line + "\n")
+
+    return path

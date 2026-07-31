@@ -213,6 +213,15 @@ function initReconcilePage() {
       link.className = "btn";
       link.textContent = "Start reviewing";
       reviewLink.appendChild(link);
+
+      const orphanLink = document.createElement("a");
+      orphanLink.href =
+        "/reconcile/review/orphans?snapshot=" +
+        encodeURIComponent(detail.review_snapshot_path);
+      orphanLink.className = "btn btn-secondary";
+      orphanLink.textContent = "Review orphans";
+      orphanLink.style.marginLeft = "0.5rem";
+      reviewLink.appendChild(orphanLink);
     }
 
     downloadsBox.innerHTML = "";
@@ -329,6 +338,14 @@ function initReconcilePage() {
       link.className = "btn btn-secondary";
       link.textContent = "Resume";
       li.appendChild(link);
+
+      const orphanLink = document.createElement("a");
+      orphanLink.href =
+        "/reconcile/review/orphans?snapshot=" + encodeURIComponent(s.path);
+      orphanLink.className = "btn btn-secondary";
+      orphanLink.textContent = "Review orphans";
+      orphanLink.style.marginLeft = "0.5rem";
+      li.appendChild(orphanLink);
 
       resumeListEl.appendChild(li);
     });
@@ -696,4 +713,278 @@ function initReconcileReviewPage() {
   });
 
   loadGaps();
+}
+
+// Orphan review: the mirror image of initReconcileReviewPage() above — for
+// each Libib entry no scrape matched, search/pick the Libib entry it
+// duplicates, flag it as no longer owned, or mark it reviewed with no
+// action needed, then finalize into a plain-text report of Libib edits to
+// make by hand.
+function initOrphanReviewPage() {
+  const app = document.getElementById("orphan-review-app");
+  if (!app) return;
+
+  const snapshot = app.dataset.snapshot;
+  const progressEl = document.getElementById("orphan-progress");
+  const saveStatusEl = document.getElementById("orphan-save-status");
+  const orphanFilterInput = document.getElementById("orphan-filter");
+  const orphanListEl = document.getElementById("orphan-list");
+  const detailEmpty = document.getElementById("orphan-detail-empty");
+  const detail = document.getElementById("orphan-detail");
+  const orphanTitleEl = document.getElementById("orphan-title");
+  const orphanAuthorEl = document.getElementById("orphan-author");
+  const orphanProvidersEl = document.getElementById("orphan-providers");
+  const resolvedNoteEl = document.getElementById("orphan-resolved-note");
+  const duplicateSearchInput = document.getElementById("duplicate-search");
+  const duplicateSearchHint = document.getElementById("duplicate-search-hint");
+  const duplicateListEl = document.getElementById("duplicate-list");
+  const needsArchiveBtn = document.getElementById("needs-archive-btn");
+  const keepBtn = document.getElementById("keep-btn");
+  const finalizeBtn = document.getElementById("orphan-finalize-btn");
+  const finalizeResult = document.getElementById("orphan-finalize-result");
+
+  let orphans = [];
+  let selectedOrphanKey = null;
+  let searchDebounceTimer = null;
+
+  function apiUrl(path, params) {
+    const url = new URL(path, window.location.origin);
+    url.searchParams.set("snapshot", snapshot);
+    Object.entries(params || {}).forEach(([k, v]) => {
+      if (v) url.searchParams.set(k, v);
+    });
+    return url.toString();
+  }
+
+  function currentOrphan() {
+    return orphans.find((o) => o.key === selectedOrphanKey) || null;
+  }
+
+  function decisionBadge(orphan) {
+    const status = orphan.resolved_via_gap_review
+      ? "resolved"
+      : orphan.decision
+      ? orphan.decision.status
+      : "undecided";
+    const span = document.createElement("span");
+    span.className = "badge badge-status-" + status;
+    span.textContent = status.replace("_", " ");
+    return span;
+  }
+
+  function updateProgress() {
+    const decided = orphans.filter(
+      (o) => o.decision || o.resolved_via_gap_review
+    ).length;
+    progressEl.textContent = decided + " / " + orphans.length + " reviewed";
+  }
+
+  function renderOrphanList() {
+    const filter = orphanFilterInput.value.trim().toLowerCase();
+    orphanListEl.innerHTML = "";
+
+    orphans
+      .filter(
+        (o) =>
+          !filter ||
+          o.title.toLowerCase().includes(filter) ||
+          o.creators.toLowerCase().includes(filter)
+      )
+      .forEach((o) => {
+        const li = document.createElement("li");
+        li.className = "review-row";
+        if (o.key === selectedOrphanKey) li.classList.add("selected");
+
+        const text = document.createElement("span");
+        text.textContent = o.title + (o.creators ? " — " + o.creators : "");
+        li.appendChild(text);
+        li.appendChild(decisionBadge(o));
+
+        li.addEventListener("click", () => selectOrphan(o.key));
+        orphanListEl.appendChild(li);
+      });
+
+    updateProgress();
+  }
+
+  async function loadOrphans() {
+    const response = await fetch(apiUrl("/api/reconcile/review/orphans"));
+    const data = await response.json();
+    orphans = data.orphans;
+    renderOrphanList();
+    if (selectedOrphanKey) renderDetailHeader();
+  }
+
+  function renderDetailHeader() {
+    const orphan = currentOrphan();
+    if (!orphan) return;
+    orphanTitleEl.textContent = orphan.title;
+    orphanAuthorEl.textContent = orphan.creators
+      ? "by " + orphan.creators
+      : "Author unknown";
+    orphanProvidersEl.textContent = orphan.providers.length
+      ? "Tagged: " + orphan.providers.join(", ")
+      : "";
+
+    resolvedNoteEl.hidden = !orphan.resolved_via_gap_review;
+
+    const isArchive = orphan.decision && orphan.decision.status === "needs_archive";
+    needsArchiveBtn.textContent = isArchive
+      ? "✓ Needs archived — click to undo"
+      : "Needs archived — no longer owned";
+
+    const isKeep = orphan.decision && orphan.decision.status === "keep";
+    keepBtn.textContent = isKeep
+      ? "✓ Kept — click to undo"
+      : "Keep — reviewed, no action needed";
+  }
+
+  function renderDuplicateList(candidates, mode, total) {
+    const orphan = currentOrphan();
+    const confirmedLibibKey =
+      orphan && orphan.decision && orphan.decision.status === "duplicate"
+        ? orphan.decision.libib_key
+        : null;
+
+    duplicateListEl.innerHTML = "";
+
+    if (mode === "search") {
+      duplicateSearchHint.hidden = total <= candidates.length;
+      if (!duplicateSearchHint.hidden) {
+        duplicateSearchHint.textContent =
+          total - candidates.length + " more — refine your search";
+      }
+    } else {
+      duplicateSearchHint.hidden = true;
+    }
+
+    candidates.forEach((item) => {
+      const candidate = mode === "search" ? item : item.candidate;
+      const li = document.createElement("li");
+      li.className = "candidate-row";
+
+      const info = document.createElement("div");
+      let label =
+        candidate.title + (candidate.creators ? " — " + candidate.creators : "");
+      if (mode === "ranked") {
+        label +=
+          " (" +
+          Math.round(item.score * 100) +
+          "% match" +
+          (item.author_overlap ? ", author overlaps" : "") +
+          ")";
+      }
+      info.appendChild(document.createTextNode(label));
+      li.appendChild(info);
+
+      const isConfirmed = candidate.key === confirmedLibibKey;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn-secondary";
+      btn.textContent = isConfirmed
+        ? "✓ Marked as duplicate — click to undo"
+        : "Mark as duplicate";
+      if (isConfirmed) li.classList.add("selected");
+      btn.addEventListener("click", () =>
+        saveDecision(isConfirmed ? "undecided" : "duplicate", candidate.key)
+      );
+      li.appendChild(btn);
+
+      duplicateListEl.appendChild(li);
+    });
+  }
+
+  async function loadDuplicates(query) {
+    if (!selectedOrphanKey) return;
+    const response = await fetch(
+      apiUrl("/api/reconcile/review/orphan-candidates", {
+        orphan_key: selectedOrphanKey,
+        q: query,
+      })
+    );
+    const data = await response.json();
+    renderDuplicateList(data.candidates, data.mode, data.total);
+  }
+
+  function selectOrphan(key) {
+    selectedOrphanKey = key;
+    duplicateSearchInput.value = "";
+    detailEmpty.hidden = true;
+    detail.hidden = false;
+    renderOrphanList();
+    renderDetailHeader();
+    loadDuplicates(null);
+  }
+
+  let saveStatusTimer = null;
+
+  function flashSaved(text) {
+    saveStatusEl.textContent = text;
+    clearTimeout(saveStatusTimer);
+    saveStatusTimer = setTimeout(() => {
+      saveStatusEl.textContent = "";
+    }, 2500);
+  }
+
+  async function saveDecision(status, libibKey) {
+    const response = await fetch(apiUrl("/api/reconcile/review/orphan-decisions"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        orphan_key: selectedOrphanKey,
+        status: status,
+        libib_key: libibKey || null,
+      }),
+    });
+    flashSaved(response.ok ? "Saved ✓" : "Error saving — try again");
+    await loadOrphans();
+    renderDetailHeader();
+    loadDuplicates(duplicateSearchInput.value.trim() || null);
+  }
+
+  orphanFilterInput.addEventListener("input", renderOrphanList);
+
+  duplicateSearchInput.addEventListener("input", () => {
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(() => {
+      loadDuplicates(duplicateSearchInput.value.trim() || null);
+    }, 200);
+  });
+
+  needsArchiveBtn.addEventListener("click", () => {
+    const orphan = currentOrphan();
+    const already = orphan && orphan.decision && orphan.decision.status === "needs_archive";
+    saveDecision(already ? "undecided" : "needs_archive", null);
+  });
+
+  keepBtn.addEventListener("click", () => {
+    const orphan = currentOrphan();
+    const already = orphan && orphan.decision && orphan.decision.status === "keep";
+    saveDecision(already ? "undecided" : "keep", null);
+  });
+
+  finalizeBtn.addEventListener("click", async () => {
+    finalizeBtn.disabled = true;
+    const response = await fetch(apiUrl("/reconcile/review/finalize-orphans"), {
+      method: "POST",
+    });
+    const data = await response.json();
+    finalizeBtn.disabled = false;
+
+    finalizeResult.hidden = false;
+    finalizeResult.innerHTML = "";
+
+    if (data.report) {
+      const link = document.createElement("a");
+      link.href = data.report.url;
+      link.className = "btn btn-secondary";
+      link.textContent = "Download " + data.report.filename;
+      finalizeResult.appendChild(link);
+    } else {
+      finalizeResult.textContent =
+        "No duplicates or archive flags recorded yet — nothing to report.";
+    }
+  });
+
+  loadOrphans();
 }

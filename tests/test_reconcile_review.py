@@ -12,15 +12,22 @@ from libib_reconcile.libib_reader import LibibEntry
 from libib_reconcile.reconciler import MatchResult, ReconcileResult, ScrapedBookResult
 from libib_reconcile.review import (
     Decision,
+    finalize_orphan_review,
     finalize_review,
     gap_has_enrichment,
+    list_orphans,
     list_review_snapshots,
     load_decisions,
+    load_orphan_decisions,
     load_review_snapshot,
     rank_candidates,
+    rank_orphan_duplicates,
     refresh_gap_enrichment,
+    resolved_via_gap_review,
     save_decision,
+    save_orphan_decision,
     search_candidates,
+    search_orphan_duplicates,
     set_manual_enrichment,
     stable_gap_key,
     stable_libib_key,
@@ -920,3 +927,187 @@ def test_list_review_snapshots_ignores_non_snapshot_files():
         summaries = list_review_snapshots(tmp)
 
     assert len(summaries) == 1
+
+
+# ==========================
+# Orphan review — the mirror image: Libib entries no scrape matched
+# ==========================
+
+
+def test_list_orphans_returns_only_libib_only_status():
+    libib_results = [
+        MatchResult(_entry("Orphan"), None, None, None, None, "libib_only"),
+        MatchResult(_entry("Ambiguous"), None, None, None, None, "ambiguous"),
+        MatchResult(_entry("OutOfScope"), None, None, None, None, "out_of_scope"),
+        MatchResult(_entry("Matched"), "kindle", None, "high", "exact_isbn", "matched"),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_snapshot(tmp, libib_results, [])
+        snapshot = load_review_snapshot(path)
+
+    titles = {o["title"] for o in list_orphans(snapshot)}
+    assert titles == {"Orphan"}
+
+
+def test_save_and_load_orphan_decision_round_trip():
+    with tempfile.TemporaryDirectory() as tmp:
+        save_orphan_decision(tmp, "orphan-key-1", "duplicate", libib_key="libib-key-1")
+        decisions = load_orphan_decisions(tmp)
+
+    assert decisions["orphan-key-1"].status == "duplicate"
+    assert decisions["orphan-key-1"].libib_key == "libib-key-1"
+
+
+def test_load_orphan_decisions_returns_empty_dict_when_no_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        assert load_orphan_decisions(tmp) == {}
+
+
+def test_save_orphan_decision_undecided_clears_prior_decision():
+    with tempfile.TemporaryDirectory() as tmp:
+        save_orphan_decision(tmp, "orphan-key-1", "needs_archive")
+        save_orphan_decision(tmp, "orphan-key-1", "undecided")
+        decisions = load_orphan_decisions(tmp)
+
+    assert "orphan-key-1" not in decisions
+
+
+def test_orphan_decisions_use_a_separate_file_from_gap_decisions():
+    """Gap-book and orphan decisions are keyed in different hash spaces
+    (stable_gap_key vs stable_libib_key) and reviewed on separate pages —
+    they must not collide or overwrite each other even if a hash happened
+    to coincide."""
+    with tempfile.TemporaryDirectory() as tmp:
+        save_decision(tmp, "shared-key", "confirmed_new")
+        save_orphan_decision(tmp, "shared-key", "needs_archive")
+
+        gap_decisions = load_decisions(tmp)
+        orphan_decisions = load_orphan_decisions(tmp)
+
+        assert gap_decisions["shared-key"].status == "confirmed_new"
+        assert orphan_decisions["shared-key"].status == "needs_archive"
+        assert os.path.exists(os.path.join(tmp, "reconcile_review_decisions.json"))
+        assert os.path.exists(os.path.join(tmp, "reconcile_orphan_decisions.json"))
+
+
+def test_resolved_via_gap_review_returns_libib_keys_confirmed_from_gap_side():
+    gap_decisions = {
+        "g1": Decision(status="confirmed_match", libib_key="c1", decided_at=""),
+        "g2": Decision(status="confirmed_new", libib_key=None, decided_at=""),
+        "g3": Decision(status="skipped", libib_key=None, decided_at=""),
+    }
+    assert resolved_via_gap_review(gap_decisions) == {"c1"}
+
+
+def test_rank_orphan_duplicates_orders_by_score_descending():
+    orphan = _candidate("o1", "The Fifth Season", "N.K. Jemisin")
+    pool = [
+        orphan,
+        _candidate("c1", "Completely Unrelated Title"),
+        _candidate("c2", "The Fifth Season", "N.K. Jemisin"),
+        _candidate("c3", "The Fifth Seasons"),
+    ]
+    ranked = rank_orphan_duplicates(orphan, pool)
+    keys_in_order = [r["candidate"]["key"] for r in ranked]
+    assert keys_in_order[0] == "c2"
+
+
+def test_rank_orphan_duplicates_excludes_itself():
+    orphan = _candidate("o1", "Dune")
+    pool = [orphan, _candidate("c1", "Dune")]
+    ranked = rank_orphan_duplicates(orphan, pool)
+    keys = [r["candidate"]["key"] for r in ranked]
+    assert "o1" not in keys
+    assert "c1" in keys
+
+
+def test_search_orphan_duplicates_excludes_only_self():
+    """Unlike search_candidates(), a candidate already claimed elsewhere is
+    still a valid duplicate target — two Libib records for the same book,
+    where only one is actually still owned, is exactly the scenario this
+    feature exists to catch."""
+    orphan = _candidate("o1", "Dune")
+    pool = [orphan, _candidate("c1", "Dune")]
+    results, total = search_orphan_duplicates("dune", pool, "o1")
+    assert total == 1
+    assert results[0]["key"] == "c1"
+
+
+def test_finalize_orphan_review_returns_none_when_nothing_decided():
+    libib_results = [MatchResult(_entry("Orphan"), None, None, None, None, "libib_only")]
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _write_snapshot(tmp, libib_results, [], timestamp="ts")
+        assert finalize_orphan_review(snapshot_path, tmp) is None
+
+
+def test_finalize_orphan_review_writes_duplicate_and_archive_lines():
+    libib_results = [
+        MatchResult(
+            _entry("Iron Widow", "Xiran Jay Zhao"), None, None, None, None, "libib_only"
+        ),
+        MatchResult(
+            _entry("Iron Widow (dup)", "Xiran Jay Zhao"),
+            None,
+            None,
+            None,
+            None,
+            "libib_only",
+        ),
+        MatchResult(
+            _entry("Stale Loan", "Author"), None, None, None, None, "libib_only"
+        ),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _write_snapshot(
+            tmp, libib_results, [], timestamp="2026-07-30_09-00"
+        )
+        snapshot = load_review_snapshot(snapshot_path)
+        orphans = list_orphans(snapshot)
+        real = next(o for o in orphans if o["title"] == "Iron Widow")
+        dup = next(o for o in orphans if o["title"] == "Iron Widow (dup)")
+        stale = next(o for o in orphans if o["title"] == "Stale Loan")
+
+        save_orphan_decision(tmp, dup["key"], "duplicate", libib_key=real["key"])
+        save_orphan_decision(tmp, stale["key"], "needs_archive")
+
+        report_path = finalize_orphan_review(snapshot_path, tmp)
+
+        assert report_path is not None
+        with open(report_path, encoding="utf-8") as f:
+            text = f.read()
+
+    assert (
+        'Archive (duplicate of "Iron Widow" by Xiran Jay Zhao): '
+        '"Iron Widow (dup)" by Xiran Jay Zhao' in text
+    )
+    assert 'Archive (no longer owned): "Stale Loan" by Author' in text
+
+
+def test_finalize_orphan_review_keep_produces_no_line():
+    libib_results = [
+        MatchResult(_entry("Fine As-Is"), None, None, None, None, "libib_only")
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _write_snapshot(tmp, libib_results, [], timestamp="ts")
+        orphan_key = list_orphans(load_review_snapshot(snapshot_path))[0]["key"]
+
+        save_orphan_decision(tmp, orphan_key, "keep")
+        report_path = finalize_orphan_review(snapshot_path, tmp)
+
+    assert report_path is None
+
+
+def test_finalize_orphan_review_is_re_runnable():
+    libib_results = [
+        MatchResult(_entry("Stale Loan"), None, None, None, None, "libib_only")
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _write_snapshot(tmp, libib_results, [], timestamp="ts")
+        orphan_key = list_orphans(load_review_snapshot(snapshot_path))[0]["key"]
+        save_orphan_decision(tmp, orphan_key, "needs_archive")
+
+        first = finalize_orphan_review(snapshot_path, tmp)
+        second = finalize_orphan_review(snapshot_path, tmp)
+
+        assert os.path.exists(first)
+        assert os.path.exists(second)

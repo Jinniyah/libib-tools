@@ -121,6 +121,13 @@ class ReconcileEnrichRequest(BaseModel):
     gap_key: str
 
 
+class OrphanDecisionRequest(BaseModel):
+    orphan_key: str
+    status: str  # "duplicate" | "needs_archive" | "keep" | "undecided"
+    libib_key: Optional[str] = None
+    note: Optional[str] = None
+
+
 class ReconcileManualEnrichmentRequest(BaseModel):
     """Always submitted as a full form snapshot, not a partial patch — every
     field reflects whatever's currently in the review page's edit form, so
@@ -652,6 +659,89 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="File not found")
 
         return FileResponse(candidate, filename=filename)
+
+    @app.get("/reconcile/review/orphans")
+    def reconcile_review_orphans_page(request: Request, snapshot: str) -> HTMLResponse:
+        # Same trust boundary as /reconcile/review above — `snapshot` is a
+        # raw local path carried forward by the user, not new exposure.
+        return templates.TemplateResponse(
+            request, "reconcile_review_orphans.html", {"snapshot": snapshot}
+        )
+
+    @app.get("/api/reconcile/review/orphans")
+    def reconcile_review_orphans(snapshot: str) -> dict[str, Any]:
+        data = reconcile_review.load_review_snapshot(snapshot)
+        output_dir = _review_output_dir(snapshot)
+        decisions = reconcile_review.load_orphan_decisions(output_dir)
+        # An orphan already linked to a gap book from the *other* review
+        # direction (the matcher missed a real match, a human found it while
+        # reviewing gaps) needs no separate orphan decision — surfaced here
+        # so the page doesn't ask the user to re-decide something already
+        # resolved.
+        resolved = reconcile_review.resolved_via_gap_review(
+            reconcile_review.load_decisions(output_dir)
+        )
+        orphans = [
+            {
+                **orphan,
+                "decision": _decision_summary(decisions, orphan["key"]),
+                "resolved_via_gap_review": orphan["key"] in resolved,
+            }
+            for orphan in reconcile_review.list_orphans(data)
+        ]
+        return {"orphans": orphans}
+
+    @app.get("/api/reconcile/review/orphan-candidates")
+    def reconcile_review_orphan_candidates(
+        snapshot: str, orphan_key: str, q: Optional[str] = None
+    ) -> dict[str, Any]:
+        data = reconcile_review.load_review_snapshot(snapshot)
+
+        orphan = next(
+            (c for c in data["candidate_pool"] if c["key"] == orphan_key), None
+        )
+        if orphan is None:
+            raise HTTPException(
+                status_code=404, detail="Orphan not found in this snapshot"
+            )
+
+        if q:
+            results, total = reconcile_review.search_orphan_duplicates(
+                q, data["candidate_pool"], orphan_key
+            )
+            return {"mode": "search", "candidates": results, "total": total}
+
+        ranked = reconcile_review.rank_orphan_duplicates(orphan, data["candidate_pool"])
+        return {"mode": "ranked", "candidates": ranked}
+
+    @app.post("/api/reconcile/review/orphan-decisions")
+    def reconcile_review_save_orphan_decision(
+        snapshot: str, body: OrphanDecisionRequest
+    ) -> dict[str, bool]:
+        reconcile_review.save_orphan_decision(
+            _review_output_dir(snapshot),
+            body.orphan_key,
+            body.status,
+            libib_key=body.libib_key,
+            note=body.note,
+        )
+        return {"ok": True}
+
+    @app.post("/reconcile/review/finalize-orphans")
+    def reconcile_review_finalize_orphans(snapshot: str) -> dict[str, Any]:
+        output_dir = _review_output_dir(snapshot)
+        report_path = reconcile_review.finalize_orphan_review(snapshot, output_dir)
+
+        if report_path is None:
+            return {"report": None}
+
+        filename = Path(report_path).name
+        return {
+            "report": {
+                "filename": filename,
+                "url": f"/reconcile/review/download?dir={output_dir}&filename={filename}",
+            }
+        }
 
     @app.get("/downloads/{job_id}/{filename}")
     def download_file(job_id: str, filename: str) -> FileResponse:

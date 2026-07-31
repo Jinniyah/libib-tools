@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+
+{% block title %}Orphan review — LibibTools{% endblock %}
+
+{% block content %}
+<p><a href="/reconcile">&larr; Back to reconcile</a></p>
+<h1>Orphan review</h1>
+<p>These are Libib entries tagged kindle/chirp/nook/bn that no scrape
+  matched — the mirror image of the gap review. For each one, decide
+  whether it's a duplicate of another Libib entry, no longer owned, or fine
+  as-is. This never edits Libib directly — it produces a report telling you
+  exactly what to change by hand.</p>
+<p>
+  <span id="orphan-progress"></span>
+  <span id="orphan-save-status" class="field-hint" style="margin-left: 0.75rem;"></span>
+</p>
+<p class="field-hint">Every decision is saved to disk immediately — closing
+  this tab, or even restarting the server, does not lose your progress.
+  Come back to this exact URL any time to resume.</p>
+
+<div class="review-layout" id="orphan-review-app" data-snapshot="{{ snapshot }}">
+  <section aria-label="Orphans" id="orphan-list-panel" class="card">
+    <div class="field">
+      <label for="orphan-filter">Filter this list</label>
+      <input type="text" id="orphan-filter" placeholder="Filter by title or author">
+    </div>
+    <ul id="orphan-list" class="review-list"></ul>
+  </section>
+
+  <section aria-label="Duplicate candidates" id="orphan-detail-panel" class="card">
+    <p id="orphan-detail-empty">Pick an orphan on the left to review it.</p>
+
+    <div id="orphan-detail" hidden>
+      <h2 id="orphan-title"></h2>
+      <p id="orphan-author" class="field-hint"></p>
+      <p id="orphan-providers" class="field-hint"></p>
+      <p id="orphan-resolved-note" class="field-hint" hidden>Already linked to
+        a scraped book from the gap review — the matcher just missed it.
+        Nothing to decide here.</p>
+
+      <div class="field">
+        <label for="duplicate-search">Search Libib for the entry this duplicates</label>
+        <input type="text" id="duplicate-search"
+               placeholder="Type a title or author to search everything, not just the suggestions below">
+      </div>
+      <p id="duplicate-search-hint" class="field-hint" hidden></p>
+
+      <ul id="duplicate-list" class="review-list"></ul>
+
+      <button type="button" class="btn btn-secondary" id="needs-archive-btn">
+        Needs archived — no longer owned
+      </button>
+      <button type="button" class="btn btn-secondary" id="keep-btn">
+        Keep — reviewed, no action needed
+      </button>
+    </div>
+  </section>
+</div>
+
+<div id="orphan-finalize-panel">
+  <button type="button" class="btn" id="orphan-finalize-btn">Finalize orphan review</button>
+  <p class="field-hint">Only orphans marked "duplicate" or "needs archived"
+    show up in the report — "keep" and undecided orphans need no action.</p>
+  <div id="orphan-finalize-result" hidden></div>
+</div>
+
+<p class="field-hint">
+  Reminder: there's no separate save step. Every decision above is written
+  to disk the moment you make it — you can close this tab or shut down the
+  server at any point and pick up exactly where you left off by reopening
+  this same URL later.
+</p>
+
+<script src="{{ url_for('static', path='/app.js') }}?v={{ asset_version }}"></script>
+<script>
+  initOrphanReviewPage();
+</script>
+{% endblock %}

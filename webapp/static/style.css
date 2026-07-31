@@ -412,6 +412,22 @@ main {
   color: var(--color-warning);
 }
 
+.badge-status-duplicate {
+  background: var(--color-warning-bg);
+  color: var(--color-warning);
+}
+
+.badge-status-needs_archive {
+  background: var(--color-danger-bg);
+  color: var(--color-danger);
+}
+
+.badge-status-keep,
+.badge-status-resolved {
+  background: var(--color-success-bg);
+  color: var(--color-success);
+}
+
 .review-layout {
   display: grid;
   grid-template-columns: minmax(16rem, 1fr) minmax(20rem, 1.5fr);

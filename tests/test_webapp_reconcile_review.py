@@ -449,3 +449,210 @@ def test_list_snapshots_route_empty_for_unknown_dir():
     )
     assert response.status_code == 200
     assert response.json()["snapshots"] == []
+
+
+# ==========================
+# Orphan review routes — the mirror image of the gap-review routes above
+# ==========================
+
+
+def _build_two_orphan_snapshot(tmp):
+    """Two libib_only entries sharing a title, so a duplicate-search/rank
+    has something real to find — same fixture style as _build_snapshot()."""
+    libib_results = [
+        MatchResult(
+            _entry("Iron Widow", "Xiran Jay Zhao"), None, None, None, None, "libib_only"
+        ),
+        MatchResult(
+            _entry("Iron Widow (dup)", "Xiran Jay Zhao"),
+            None,
+            None,
+            None,
+            None,
+            "libib_only",
+        ),
+    ]
+    result = ReconcileResult(libib_results=libib_results, scraped_results=[])
+    return write_review_snapshot(result, [], {}, tmp, "2026-07-30_09-00")
+
+
+def test_orphans_page_renders():
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _build_snapshot(tmp)
+        response = client.get(
+            "/reconcile/review/orphans", params={"snapshot": snapshot_path}
+        )
+    assert response.status_code == 200
+
+
+def test_orphans_route_returns_orphan_list_with_no_decision():
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _build_snapshot(tmp)
+        response = client.get(
+            "/api/reconcile/review/orphans", params={"snapshot": snapshot_path}
+        )
+    assert response.status_code == 200
+    orphans = response.json()["orphans"]
+    assert len(orphans) == 1
+    assert orphans[0]["title"] == "Iron Widow"
+    assert orphans[0]["decision"] is None
+    assert orphans[0]["resolved_via_gap_review"] is False
+
+
+def test_orphans_route_reflects_saved_decision():
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _build_snapshot(tmp)
+        orphan_key = client.get(
+            "/api/reconcile/review/orphans", params={"snapshot": snapshot_path}
+        ).json()["orphans"][0]["key"]
+
+        client.post(
+            "/api/reconcile/review/orphan-decisions",
+            params={"snapshot": snapshot_path},
+            json={"orphan_key": orphan_key, "status": "needs_archive"},
+        )
+
+        response = client.get(
+            "/api/reconcile/review/orphans", params={"snapshot": snapshot_path}
+        )
+    assert response.json()["orphans"][0]["decision"]["status"] == "needs_archive"
+
+
+def test_orphans_route_flags_resolved_via_gap_review():
+    """An orphan already linked to a gap book from the gap-review side (the
+    matcher missed a real match) must show as resolved without a separate
+    orphan decision."""
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _build_snapshot(tmp)
+        gap_key = client.get(
+            "/api/reconcile/review/gaps", params={"snapshot": snapshot_path}
+        ).json()["gaps"][0]["key"]
+        libib_key = client.get(
+            "/api/reconcile/review/candidates",
+            params={"snapshot": snapshot_path, "gap_key": gap_key},
+        ).json()["candidates"][0]["candidate"]["key"]
+
+        client.post(
+            "/api/reconcile/review/decisions",
+            params={"snapshot": snapshot_path},
+            json={
+                "gap_key": gap_key,
+                "status": "confirmed_match",
+                "libib_key": libib_key,
+            },
+        )
+
+        response = client.get(
+            "/api/reconcile/review/orphans", params={"snapshot": snapshot_path}
+        )
+    orphan = next(o for o in response.json()["orphans"] if o["key"] == libib_key)
+    assert orphan["resolved_via_gap_review"] is True
+
+
+def test_orphan_candidates_ranked_mode():
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _build_two_orphan_snapshot(tmp)
+        orphans = client.get(
+            "/api/reconcile/review/orphans", params={"snapshot": snapshot_path}
+        ).json()["orphans"]
+        orphan_key = next(o["key"] for o in orphans if o["title"] == "Iron Widow (dup)")
+
+        response = client.get(
+            "/api/reconcile/review/orphan-candidates",
+            params={"snapshot": snapshot_path, "orphan_key": orphan_key},
+        )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["mode"] == "ranked"
+    assert data["candidates"][0]["candidate"]["title"] == "Iron Widow"
+
+
+def test_orphan_candidates_search_mode():
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _build_two_orphan_snapshot(tmp)
+        orphans = client.get(
+            "/api/reconcile/review/orphans", params={"snapshot": snapshot_path}
+        ).json()["orphans"]
+        orphan_key = next(o["key"] for o in orphans if o["title"] == "Iron Widow (dup)")
+
+        response = client.get(
+            "/api/reconcile/review/orphan-candidates",
+            params={"snapshot": snapshot_path, "orphan_key": orphan_key, "q": "iron"},
+        )
+    data = response.json()
+    assert data["mode"] == "search"
+    assert data["candidates"][0]["title"] == "Iron Widow"
+
+
+def test_orphan_candidates_unknown_orphan_key_404():
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _build_snapshot(tmp)
+        response = client.get(
+            "/api/reconcile/review/orphan-candidates",
+            params={"snapshot": snapshot_path, "orphan_key": "not-a-real-key"},
+        )
+    assert response.status_code == 404
+
+
+def test_orphan_decision_persists_to_disk_in_its_own_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _build_two_orphan_snapshot(tmp)
+        orphans = client.get(
+            "/api/reconcile/review/orphans", params={"snapshot": snapshot_path}
+        ).json()["orphans"]
+        dup_key = next(o["key"] for o in orphans if o["title"] == "Iron Widow (dup)")
+        real_key = next(o["key"] for o in orphans if o["title"] == "Iron Widow")
+
+        response = client.post(
+            "/api/reconcile/review/orphan-decisions",
+            params={"snapshot": snapshot_path},
+            json={"orphan_key": dup_key, "status": "duplicate", "libib_key": real_key},
+        )
+        assert response.status_code == 200
+
+        decisions_path = os.path.join(tmp, "reconcile_orphan_decisions.json")
+        with open(decisions_path, encoding="utf-8") as f:
+            raw = json.load(f)
+    assert raw[dup_key]["status"] == "duplicate"
+    assert raw[dup_key]["libib_key"] == real_key
+
+
+def test_finalize_orphans_returns_null_report_when_nothing_decided():
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _build_snapshot(tmp)
+        response = client.post(
+            "/reconcile/review/finalize-orphans", params={"snapshot": snapshot_path}
+        )
+    assert response.status_code == 200
+    assert response.json()["report"] is None
+
+
+def test_finalize_orphans_returns_download_link_after_decision():
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = _build_two_orphan_snapshot(tmp)
+        orphans = client.get(
+            "/api/reconcile/review/orphans", params={"snapshot": snapshot_path}
+        ).json()["orphans"]
+        dup_key = next(o["key"] for o in orphans if o["title"] == "Iron Widow (dup)")
+        real_key = next(o["key"] for o in orphans if o["title"] == "Iron Widow")
+
+        client.post(
+            "/api/reconcile/review/orphan-decisions",
+            params={"snapshot": snapshot_path},
+            json={"orphan_key": dup_key, "status": "duplicate", "libib_key": real_key},
+        )
+
+        response = client.post(
+            "/reconcile/review/finalize-orphans", params={"snapshot": snapshot_path}
+        )
+        assert response.status_code == 200
+        report = response.json()["report"]
+        assert report is not None
+        assert report["filename"].endswith("_orphan_review.txt")
+
+        download = client.get(
+            "/reconcile/review/download",
+            params={"dir": tmp, "filename": report["filename"]},
+        )
+    assert download.status_code == 200
+    assert "Iron Widow (dup)" in download.text
