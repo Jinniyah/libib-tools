@@ -380,6 +380,7 @@ function initReconcileReviewPage() {
   const saveMetadataBtn = document.getElementById("save-metadata-btn");
   const finalizeBtn = document.getElementById("finalize-btn");
   const finalizeResult = document.getElementById("finalize-result");
+  const gapSummaryEl = document.getElementById("gap-summary");
 
   let gaps = [];
   let selectedGapKey = null;
@@ -409,6 +410,25 @@ function initReconcileReviewPage() {
   function updateProgress() {
     const decided = gaps.filter((g) => g.decision).length;
     progressEl.textContent = decided + " / " + gaps.length + " reviewed";
+  }
+
+  function renderGapSummary() {
+    const order = ["undecided", "confirmed_match", "confirmed_new", "skipped"];
+    const counts = Object.fromEntries(order.map((s) => [s, 0]));
+    gaps.forEach((g) => {
+      const status = g.decision ? g.decision.status : "undecided";
+      counts[status] = (counts[status] || 0) + 1;
+    });
+
+    gapSummaryEl.innerHTML = "";
+    order
+      .filter((status) => counts[status] > 0)
+      .forEach((status) => {
+        const span = document.createElement("span");
+        span.className = "badge badge-status-" + status;
+        span.textContent = counts[status] + " " + status.replace("_", " ");
+        gapSummaryEl.appendChild(span);
+      });
   }
 
   function renderGapList() {
@@ -446,6 +466,7 @@ function initReconcileReviewPage() {
       });
 
     updateProgress();
+    renderGapSummary();
   }
 
   async function loadGaps() {
@@ -464,7 +485,21 @@ function initReconcileReviewPage() {
     metaLength.value = e.length_of || "";
     metaSeriesName.value = e.series_name || "";
     metaSeriesPosition.value = e.series_position != null ? e.series_position : "";
+    saveMetadataBtn.disabled = true;
   }
+
+  [
+    metaDescription,
+    metaPublisher,
+    metaPublishDate,
+    metaLength,
+    metaSeriesName,
+    metaSeriesPosition,
+  ].forEach((field) =>
+    field.addEventListener("input", () => {
+      saveMetadataBtn.disabled = false;
+    })
+  );
 
   function renderCandidateHeader() {
     const gap = currentGap();
@@ -678,12 +713,15 @@ function initReconcileReviewPage() {
         }
         flashSaved("Saved ✓");
         renderGapList();
+        saveMetadataBtn.disabled = true;
       } else {
         const body = await response.json().catch(() => ({}));
         flashSaved("Error saving metadata: " + (body.detail || response.statusText));
+        saveMetadataBtn.disabled = false;
       }
-    } finally {
+    } catch (err) {
       saveMetadataBtn.disabled = false;
+      throw err;
     }
   });
 
@@ -742,6 +780,7 @@ function initOrphanReviewPage() {
   const keepBtn = document.getElementById("keep-btn");
   const finalizeBtn = document.getElementById("orphan-finalize-btn");
   const finalizeResult = document.getElementById("orphan-finalize-result");
+  const orphanSummaryEl = document.getElementById("orphan-summary");
 
   let orphans = [];
   let selectedOrphanKey = null;
@@ -761,11 +800,7 @@ function initOrphanReviewPage() {
   }
 
   function decisionBadge(orphan) {
-    const status = orphan.resolved_via_gap_review
-      ? "resolved"
-      : orphan.decision
-      ? orphan.decision.status
-      : "undecided";
+    const status = orphanStatus(orphan);
     const span = document.createElement("span");
     span.className = "badge badge-status-" + status;
     span.textContent = status.replace("_", " ");
@@ -777,6 +812,33 @@ function initOrphanReviewPage() {
       (o) => o.decision || o.resolved_via_gap_review
     ).length;
     progressEl.textContent = decided + " / " + orphans.length + " reviewed";
+  }
+
+  function orphanStatus(o) {
+    return o.resolved_via_gap_review
+      ? "resolved"
+      : o.decision
+      ? o.decision.status
+      : "undecided";
+  }
+
+  function renderOrphanSummary() {
+    const order = ["undecided", "resolved", "duplicate", "needs_archive", "keep"];
+    const counts = Object.fromEntries(order.map((s) => [s, 0]));
+    orphans.forEach((o) => {
+      const status = orphanStatus(o);
+      counts[status] = (counts[status] || 0) + 1;
+    });
+
+    orphanSummaryEl.innerHTML = "";
+    order
+      .filter((status) => counts[status] > 0)
+      .forEach((status) => {
+        const span = document.createElement("span");
+        span.className = "badge badge-status-" + status;
+        span.textContent = counts[status] + " " + status.replace("_", " ");
+        orphanSummaryEl.appendChild(span);
+      });
   }
 
   function renderOrphanList() {
@@ -805,6 +867,7 @@ function initOrphanReviewPage() {
       });
 
     updateProgress();
+    renderOrphanSummary();
   }
 
   async function loadOrphans() {
