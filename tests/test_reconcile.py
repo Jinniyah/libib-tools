@@ -2,6 +2,7 @@ from difflib import SequenceMatcher
 
 from libib_reconcile.libib_reader import LibibEntry
 from libib_reconcile.reconciler import (
+    _core_title_match,
     _dedupe_scraped_books,
     _is_title_containment,
     reconcile,
@@ -151,6 +152,66 @@ def test_fuzzy_match_series_suffix_requires_author_corroboration():
     assert result.libib_results[0].status == "libib_only"
 
 
+def test_fuzzy_match_finds_same_book_under_different_series_branding():
+    """Real case found live (2026-08-02): the same book carries a different
+    series name on each side — Libib's "Sabriel (Old Kingdom Book 1)" vs.
+    a Kindle scrape's "Sabriel (The Abhorsen Trilogy)" — same book, same
+    author, same series just branded differently. Neither containment nor
+    the plain ratio catches this (neither bracketed text is a substring of
+    the other), but both peel down to the same core title "Sabriel"."""
+    entry = _entry("Sabriel (Old Kingdom Book 1)", "Garth Nix", providers={"kindle"})
+    scraped = {"kindle": [("Sabriel (The Abhorsen Trilogy)", "Garth Nix", None, "cover")]}
+
+    result = reconcile([entry], scraped)
+
+    match = result.libib_results[0]
+    assert match.status == "matched"
+    assert match.confidence == "medium"
+
+
+def test_fuzzy_match_finds_book_under_amazon_marketing_subtitle():
+    """Real case found live (2026-08-02): Amazon/Kindle titles are often
+    padded with marketing copy around the real title — "The Mediator #6:
+    Twilight: A Thrilling Supernatural Romance Where a Mediator's Love for
+    a Ghost Collides with the Power to Alter History" is the same book as
+    Libib's "Twilight (The Mediator, Book 6)". The real title is buried in
+    unrelated surrounding text on both sides, not a clean substring of
+    either — peeling off everything after the first colon on each side
+    finds it."""
+    entry = _entry("Twilight (The Mediator, Book 6)", "Meg Cabot", providers={"kindle"})
+    scraped = {
+        "kindle": [
+            (
+                "The Mediator #6: Twilight: A Thrilling Supernatural Romance "
+                "Where a Mediator's Love for a Ghost Collides with the Power "
+                "to Alter History",
+                "Meg Cabot",
+                None,
+                "cover",
+            )
+        ]
+    }
+
+    result = reconcile([entry], scraped)
+
+    match = result.libib_results[0]
+    assert match.status == "matched"
+    assert match.confidence == "medium"
+
+
+def test_core_title_match_requires_author_corroboration_in_practice():
+    """Like plain containment, a core-title match alone isn't enough to
+    accept a fuzzy match — it's a weaker signal than a strong ratio."""
+    entry = _entry("Sabriel (Old Kingdom Book 1)", "Garth Nix", providers={"kindle"})
+    scraped = {
+        "kindle": [("Sabriel (The Abhorsen Trilogy)", "A Different Author", None, "cover")]
+    }
+
+    result = reconcile([entry], scraped)
+
+    assert result.libib_results[0].status == "libib_only"
+
+
 def test_fuzzy_match_scoped_to_tagged_providers():
     """Even a great fuzzy candidate in an untagged provider's pool must not match."""
     entry = _entry("The Fifth Season", "N.K. Jemisin", providers={"kindle"})
@@ -268,6 +329,27 @@ def test_title_containment_ignores_single_word_coincidences():
     """A guard against one very short title trivially appearing inside an
     unrelated longer one — requires the shorter side to be non-trivial."""
     assert not _is_title_containment("At", "Cat on a Hot Tin Roof")
+
+
+def test_core_title_match_strips_differing_series_parentheticals():
+    assert _core_title_match(
+        "Sabriel (Old Kingdom Book 1)", "Sabriel (The Abhorsen Trilogy)"
+    )
+
+
+def test_core_title_match_strips_marketing_subtitle_after_colon():
+    assert _core_title_match(
+        "Twilight (The Mediator, Book 6)",
+        "The Mediator #6: Twilight: A Thrilling Supernatural Romance Where "
+        "a Mediator's Love for a Ghost Collides with the Power to Alter "
+        "History",
+    )
+
+
+def test_core_title_match_false_for_unrelated_titles():
+    assert not _core_title_match(
+        "Sabriel (Old Kingdom Book 1)", "Completely Different Book (Volume 1)"
+    )
 
 
 def test_title_score_boosts_containment_matches_above_raw_ratio():

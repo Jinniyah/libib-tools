@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import importlib
 import logging
 from collections.abc import Callable
@@ -114,8 +115,13 @@ def _load_scrape_csv(path: str) -> list[ScrapedBook]:
     books: list[ScrapedBook] = []
     with open(path, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
-            title = (row.get("title") or "").strip()
-            author = (row.get("creators") or "").strip()
+            # html.unescape() defensively, on top of the scrapers' own fix
+            # for this (see kindle_to_libib._element_text) — this path is
+            # also how already-scraped CSVs from *before* that fix landed
+            # get read back in, and a re-scrape isn't always convenient
+            # just to pick up a title-text fix.
+            title = html.unescape((row.get("title") or "").strip())
+            author = html.unescape((row.get("creators") or "").strip())
             ean_isbn13 = (row.get("ean_isbn13") or "").strip()
             upc_isbn10 = (row.get("upc_isbn10") or "").strip()
             isbn = ean_isbn13 or upc_isbn10 or None

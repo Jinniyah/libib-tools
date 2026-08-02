@@ -126,6 +126,28 @@ def test_load_scrape_csv_prefers_ean13_over_upc10():
     assert books[0][2] == "9780593135204"
 
 
+def test_load_scrape_csv_decodes_html_entities():
+    """Real case found live (2026-08-02): ~3% of a real Kindle export had a
+    literal "&amp;" in the title/author fields (a double-encoded entity
+    baked into the scraped CSV, from before the scrapers' own textContent
+    fix) — decoded defensively here too so already-scraped CSVs benefit
+    without a re-scrape."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "scrape.csv")
+
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=LIBIB_HEADERS)
+            writer.writeheader()
+            row = {h: "" for h in LIBIB_HEADERS}
+            row["title"] = "Terciel &amp; Elinor"
+            row["creators"] = "Garth Nix &amp; Someone Else"
+            writer.writerow(row)
+
+        books = _load_scrape_csv(path)
+    assert books[0][0] == "Terciel & Elinor"
+    assert books[0][1] == "Garth Nix & Someone Else"
+
+
 # ==========================
 # run() — provider source validation
 # ==========================

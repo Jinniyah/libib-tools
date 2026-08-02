@@ -3,6 +3,7 @@
 import argparse
 import csv
 import getpass
+import html
 import logging
 import os
 import time
@@ -228,9 +229,17 @@ def _element_text(el: WebElement) -> str:
     still mid-render/transition — confirmed live on Chirp's identical
     pattern as the source of books coming back with a real author but a
     blank title. textContent reads the DOM's actual text regardless of
-    render/animation state."""
+    render/animation state.
+
+    html.unescape() on top: some Amazon titles render with a literally
+    double-encoded entity in the DOM text itself (e.g. "Terciel &amp;
+    Elinor" as the actual textContent, not "Terciel & Elinor") — a real
+    case found live (2026-08-02) affecting ~3% of a real Kindle library
+    and defeating title matching against Libib's plain "&" for every one
+    of them. Harmless no-op on ordinary text with no entities."""
     content = el.get_attribute("textContent")
-    return content.strip() if content else el.text.strip()
+    text = content.strip() if content else el.text.strip()
+    return html.unescape(text)
 
 
 def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str]]:

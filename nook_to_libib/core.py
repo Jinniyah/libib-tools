@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import logging
 import os
 from collections.abc import Callable, Iterable
@@ -185,9 +186,17 @@ def _element_text(el: WebElement) -> str:
     still mid-render/transition — confirmed live on Chirp's identical
     pattern as the source of books coming back with a real author but a
     blank title. textContent reads the DOM's actual text regardless of
-    render/animation state."""
+    render/animation state.
+
+    html.unescape() on top: a real Kindle case (2026-08-02) found titles
+    rendering with a literally double-encoded entity in the DOM text
+    itself (e.g. "Terciel &amp; Elinor" as the actual textContent) —
+    applied here too since this helper's identical across scrapers and
+    the same site behavior could surface anywhere. Harmless no-op on
+    ordinary text with no entities."""
     content = el.get_attribute("textContent")
-    return content.strip() if content else el.text.strip()
+    text = content.strip() if content else el.text.strip()
+    return html.unescape(text)
 
 
 def _parse_items(items: Iterable[WebElement]) -> list[tuple[str, str, str, str]]:

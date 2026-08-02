@@ -92,6 +92,28 @@ def test_parse_items_missing_cover():
     assert result[0][2] == ""
 
 
+@patch.dict("chirp_to_libib.core.__dict__", _SELENIUM_PATCHES)
+def test_parse_items_decodes_html_entities_in_title_and_author():
+    """Real case found live (2026-08-02): some Amazon/Chirp titles render
+    with a literally double-encoded entity in the DOM text itself (e.g.
+    "Terciel &amp; Elinor" as the actual textContent, not "Terciel &
+    Elinor") — defeating title matching against Libib's plain "&" for
+    every one of them."""
+    item = MagicMock()
+    img_mock = MagicMock()
+    img_mock.get_attribute.side_effect = lambda attr: (
+        None if attr == "srcset" else "http://example.com/cover.jpg"
+    )
+    item.find_element.side_effect = [
+        _mock_text_element("Terciel &amp; Elinor"),
+        _mock_text_element("By Garth Nix &amp; Someone Else"),
+        img_mock,
+    ]
+    result = _parse_items([item])
+    assert result[0][0] == "Terciel & Elinor"
+    assert result[0][1] == "Garth Nix & Someone Else"
+
+
 # ==========================
 # SCRAPE TESTS (MOCKED SELENIUM)
 # ==========================
