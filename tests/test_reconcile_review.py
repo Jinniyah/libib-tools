@@ -1034,7 +1034,9 @@ def test_search_orphan_duplicates_excludes_only_self():
 
 
 def test_finalize_orphan_review_returns_none_when_nothing_decided():
-    libib_results = [MatchResult(_entry("Orphan"), None, None, None, None, "libib_only")]
+    libib_results = [
+        MatchResult(_entry("Orphan"), None, None, None, None, "libib_only")
+    ]
     with tempfile.TemporaryDirectory() as tmp:
         snapshot_path = _write_snapshot(tmp, libib_results, [], timestamp="ts")
         assert finalize_orphan_review(snapshot_path, tmp) is None

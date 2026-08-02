@@ -803,7 +803,9 @@ def finalize_orphan_review(snapshot_path: str, output_dir: str) -> Optional[str]
         label = f'"{orphan["title"]}" by {orphan["creators"]}'
         if decision.status == "duplicate":
             dup = candidates_by_key.get(decision.libib_key or "")
-            dup_label = f'"{dup["title"]}" by {dup["creators"]}' if dup else "another entry"
+            dup_label = (
+                f'"{dup["title"]}" by {dup["creators"]}' if dup else "another entry"
+            )
             lines.append(f"Archive (duplicate of {dup_label}): {label}")
         elif decision.status == "needs_archive":
             lines.append(f"Archive (no longer owned): {label}")

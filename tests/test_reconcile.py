@@ -160,7 +160,9 @@ def test_fuzzy_match_finds_same_book_under_different_series_branding():
     the plain ratio catches this (neither bracketed text is a substring of
     the other), but both peel down to the same core title "Sabriel"."""
     entry = _entry("Sabriel (Old Kingdom Book 1)", "Garth Nix", providers={"kindle"})
-    scraped = {"kindle": [("Sabriel (The Abhorsen Trilogy)", "Garth Nix", None, "cover")]}
+    scraped = {
+        "kindle": [("Sabriel (The Abhorsen Trilogy)", "Garth Nix", None, "cover")]
+    }
 
     result = reconcile([entry], scraped)
 
@@ -204,7 +206,9 @@ def test_core_title_match_requires_author_corroboration_in_practice():
     accept a fuzzy match — it's a weaker signal than a strong ratio."""
     entry = _entry("Sabriel (Old Kingdom Book 1)", "Garth Nix", providers={"kindle"})
     scraped = {
-        "kindle": [("Sabriel (The Abhorsen Trilogy)", "A Different Author", None, "cover")]
+        "kindle": [
+            ("Sabriel (The Abhorsen Trilogy)", "A Different Author", None, "cover")
+        ]
     }
 
     result = reconcile([entry], scraped)
